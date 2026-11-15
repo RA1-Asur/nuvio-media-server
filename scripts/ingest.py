@@ -233,6 +233,24 @@ def sync_catalog_index(ia_item_id, access_key, secret_key, new_entry):
     )
     print("[SUCCESS] catalog_index.json synchronized on Internet Archive.")
 
+    # Notify Cloudflare Worker to update KV immediately
+    worker_url = os.environ.get("WORKER_URL", "https://nuvio-media-server.deepanshmahawar0.workers.dev")
+    admin_pin = os.environ.get("ADMIN_PIN")
+    if worker_url and admin_pin:
+        try:
+            print(f"[INFO] Notifying Cloudflare Worker KV ({worker_url}/api/catalog/append)...")
+            append_res = requests.post(
+                f"{worker_url}/api/catalog/append",
+                json={"entry": new_entry, "admin_pin": admin_pin},
+                timeout=10
+            )
+            if append_res.status_code == 200:
+                print("[SUCCESS] Cloudflare KV catalog updated instantly!")
+            else:
+                print(f"[WARNING] Worker KV notify returned HTTP {append_res.status_code}")
+        except Exception as e:
+            print(f"[WARNING] Could not notify Cloudflare Worker KV: {e}")
+
 
 def main():
     args = parse_args()

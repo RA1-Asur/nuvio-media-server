@@ -20,3 +20,8 @@ catalog_index.json
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+*.log
+run_logs/
+run_logs.zip
+attachments/
+

@@ -111,8 +111,20 @@ export default {
 
       // 7. API: Fetch Catalog items for dashboard
       if (path === '/api/catalog') {
-        const catalog = await fetchCatalog(env);
+        const urlObj = new URL(request.url);
+        const forceRefresh = urlObj.searchParams.get('refresh') === '1';
+        const catalog = await fetchCatalog(env, forceRefresh);
         return jsonResponse(catalog);
+      }
+
+      // 8. API: Delete Video from Archive.org Vault & Sync Catalog
+      if (path === '/api/delete' && request.method === 'POST') {
+        return await handleDelete(request, env);
+      }
+
+      // 9. API: Append Video to Catalog (called by ingestion engine)
+      if (path === '/api/catalog/append' && request.method === 'POST') {
+        return await handleCatalogAppend(request, env);
       }
 
       // 404 Not Found
@@ -142,11 +154,23 @@ function jsonResponse(data, status = 200, extraHeaders = {}) {
 }
 
 /**
- * Fetch catalog index from Internet Archive item
+ * Fetch catalog index from Cloudflare KV (instant) or Internet Archive item
  * Cross-references with live Archive.org metadata so if a file is deleted
  * from Archive.org, it automatically disappears from the Nuvio catalogue!
  */
-async function fetchCatalog(env) {
+async function fetchCatalog(env, forceRefresh = false) {
+  // 1. Check Cloudflare KV for ultra-fast instant catalog
+  if (!forceRefresh && env.VAULT_KV) {
+    try {
+      const cached = await env.VAULT_KV.get('catalog', 'json');
+      if (cached && Array.isArray(cached.items)) {
+        return cached;
+      }
+    } catch (e) {
+      console.warn('KV read error:', e.message);
+    }
+  }
+
   const itemId = env.IA_ITEM_ID || 'nuvio-cloud-vault-2026';
   const catalogUrl = `https://archive.org/download/${itemId}/catalog_index.json?_t=${Date.now()}`;
   const metadataUrl = `https://archive.org/metadata/${itemId}`;
@@ -180,6 +204,7 @@ async function fetchCatalog(env) {
       } catch (_) {}
     }
 
+    let catalogResult = null;
     if (catRes.status === 'fulfilled' && catRes.value.ok) {
       const data = await catRes.value.json();
       let rawItems = Array.isArray(data)
@@ -193,18 +218,30 @@ async function fetchCatalog(env) {
         rawItems = rawItems.filter((item) => activeFilenames.has(item.filename));
       }
 
-      return { version: 1, items: rawItems, itemId };
+      catalogResult = { version: 1, items: rawItems, itemId };
+    } else if (fallbackFiles.length > 0) {
+      catalogResult = parseArchiveFiles(fallbackFiles, itemId);
     }
 
-    // Fallback: parse directly from archive metadata
-    if (fallbackFiles.length > 0) {
-      return parseArchiveFiles(fallbackFiles, itemId);
+    if (catalogResult) {
+      if (env.VAULT_KV) {
+        try {
+          await env.VAULT_KV.put('catalog', JSON.stringify(catalogResult));
+        } catch (_) {}
+      }
+      return catalogResult;
     }
   } catch (e) {
     console.warn('fetchCatalog error:', e.message);
   }
 
-  return await fetchArchiveMetadataFallback(itemId);
+  const fallback = await fetchArchiveMetadataFallback(itemId);
+  if (env.VAULT_KV && fallback) {
+    try {
+      await env.VAULT_KV.put('catalog', JSON.stringify(fallback));
+    } catch (_) {}
+  }
+  return fallback;
 }
 
 /**
@@ -556,6 +593,188 @@ async function handleEnqueue(request, env) {
 }
 
 /**
+ * Archive.org S3 Fetch Helper
+ * Follows HTTP 307 TemporaryRedirect with S3 authorization headers
+ */
+async function s3Fetch(url, options = {}) {
+  const res = await fetch(url, { ...options, redirect: 'manual' });
+  if (res.status === 307 || res.status === 301 || res.status === 302) {
+    const loc = res.headers.get('Location');
+    if (loc) {
+      return await fetch(loc, options);
+    }
+  }
+  return res;
+}
+
+/**
+ * Handle API Delete: Deletes video and thumbnail from Archive.org S3
+ * and syncs catalog_index.json
+ */
+async function handleDelete(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return jsonResponse({ success: false, error: 'Invalid JSON body' }, 400);
+  }
+
+  const { id, filename, admin_pin } = body;
+
+  if (!filename && !id) {
+    return jsonResponse({ success: false, error: 'filename or id is required' }, 400);
+  }
+
+  // Security Check: Verify ADMIN_PIN
+  const configuredPin = env.ADMIN_PIN;
+  if (!configuredPin) {
+    return jsonResponse({ success: false, error: 'ADMIN_PIN is not set in Worker' }, 500);
+  }
+  if (!admin_pin || String(admin_pin) !== String(configuredPin)) {
+    return jsonResponse({ success: false, error: 'Unauthorized: Invalid Admin PIN' }, 401);
+  }
+
+  const itemId = env.IA_ITEM_ID || 'nuvio-cloud-vault-2026';
+  const accessKey = env.IA_ACCESS_KEY;
+  const secretKey = env.IA_SECRET_KEY;
+
+  if (!accessKey || !secretKey) {
+    return jsonResponse(
+      { success: false, error: 'IA_ACCESS_KEY or IA_SECRET_KEY not configured in Worker' },
+      500
+    );
+  }
+
+  const catalog = await fetchCatalog(env);
+  const targetItem = catalog.items.find((i) => i.id === id || i.filename === filename);
+  const targetFilename = filename || (targetItem ? targetItem.filename : null);
+
+  if (!targetFilename) {
+    return jsonResponse({ success: false, error: 'Could not resolve target filename to delete' }, 404);
+  }
+
+  const updatedItems = catalog.items.filter(
+    (i) => i.id !== id && i.filename !== targetFilename
+  );
+  const newCatalog = {
+    version: 1,
+    item_id: itemId,
+    updated_at: new Date().toISOString(),
+    items: updatedItems,
+  };
+
+  // 1. Instantly update Cloudflare KV so Nuvio and Dashboard reflect deletion with 0ms lag
+  if (env.VAULT_KV) {
+    try {
+      await env.VAULT_KV.put('catalog', JSON.stringify(newCatalog));
+    } catch (e) {
+      console.warn('Failed to update KV after delete:', e.message);
+    }
+  }
+
+  const s3Auth = `LOW ${accessKey}:${secretKey}`;
+  const s3Headers = {
+    'Authorization': s3Auth,
+    'x-archive-cascade-delete': '1',
+    'x-archive-keep-old-version': '0',
+  };
+
+  // 2. Delete video file from S3 using redirect-aware s3Fetch
+  const videoDeleteUrl = `https://s3.us.archive.org/${itemId}/${encodeURIComponent(targetFilename)}`;
+  try {
+    await s3Fetch(videoDeleteUrl, {
+      method: 'DELETE',
+      headers: s3Headers,
+    });
+  } catch (err) {
+    console.warn('Failed to delete video file:', err.message);
+  }
+
+  // 3. Delete companion thumbnail if present
+  const thumbFilename = `${targetFilename}_thumb.jpg`;
+  try {
+    await s3Fetch(`https://s3.us.archive.org/${itemId}/${encodeURIComponent(thumbFilename)}`, {
+      method: 'DELETE',
+      headers: s3Headers,
+    });
+  } catch (_) {}
+
+  // 4. Update and re-upload catalog_index.json using redirect-aware s3Fetch
+  try {
+    const catalogStr = JSON.stringify(newCatalog, null, 2);
+    const catalogBytes = new TextEncoder().encode(catalogStr);
+
+    await s3Fetch(`https://s3.us.archive.org/${itemId}/catalog_index.json`, {
+      method: 'PUT',
+      headers: {
+        'Authorization': s3Auth,
+        'x-archive-no-derive': '1',
+        'Content-Type': 'application/json',
+        'Content-Length': String(catalogBytes.byteLength),
+      },
+      body: catalogBytes,
+    });
+  } catch (err) {
+    console.warn('Failed to update catalog_index.json after delete:', err.message);
+  }
+
+  return jsonResponse({
+    success: true,
+    message: `Video successfully deleted from Archive.org vault!`,
+    deleted_filename: targetFilename,
+  });
+}
+
+/**
+ * Handle Catalog Append: Appends newly ingested video to Cloudflare KV
+ */
+async function handleCatalogAppend(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return jsonResponse({ success: false, error: 'Invalid JSON body' }, 400);
+  }
+
+  const { entry, admin_pin } = body;
+  if (!entry || !entry.id) {
+    return jsonResponse({ success: false, error: 'Valid entry is required' }, 400);
+  }
+
+  const configuredPin = env.ADMIN_PIN;
+  if (!configuredPin || String(admin_pin) !== String(configuredPin)) {
+    return jsonResponse({ success: false, error: 'Unauthorized: Invalid Admin PIN' }, 401);
+  }
+
+  const catalog = await fetchCatalog(env);
+  const updatedItems = [
+    entry,
+    ...catalog.items.filter((i) => i.id !== entry.id && i.filename !== entry.filename),
+  ];
+
+  const newCatalog = {
+    version: 1,
+    item_id: env.IA_ITEM_ID || 'nuvio-cloud-vault-2026',
+    updated_at: new Date().toISOString(),
+    items: updatedItems,
+  };
+
+  if (env.VAULT_KV) {
+    try {
+      await env.VAULT_KV.put('catalog', JSON.stringify(newCatalog));
+    } catch (e) {
+      console.warn('Failed to update KV on append:', e.message);
+    }
+  }
+
+  return jsonResponse({
+    success: true,
+    message: 'Video appended to catalog successfully!',
+    count: updatedItems.length,
+  });
+}
+
+/**
  * Handle Dashboard HTML UI
  */
 function handleDashboard(request, env) {
@@ -747,6 +966,17 @@ function handleDashboard(request, env) {
       background: rgba(255, 255, 255, 0.14);
     }
 
+    .btn-danger {
+      background: rgba(239, 68, 68, 0.15);
+      color: #fca5a5;
+      border: 1px solid rgba(239, 68, 68, 0.3);
+    }
+    .btn-danger:hover {
+      background: rgba(239, 68, 68, 0.35);
+      color: #ffffff;
+      box-shadow: 0 4px 14px rgba(239, 68, 68, 0.4);
+    }
+
     .btn-row {
       display: flex;
       gap: 12px;
@@ -894,6 +1124,8 @@ function handleDashboard(request, env) {
     }
 
     .video-actions {
+      display: flex;
+      gap: 8px;
       margin-top: 8px;
     }
 
@@ -1013,7 +1245,7 @@ function handleDashboard(request, env) {
           <span>🎬</span>
           <span>Vault Catalog (<span id="itemCount">Loading...</span>)</span>
         </div>
-        <button class="btn btn-secondary btn-sm" onclick="loadCatalog()" style="width: auto;">🔄 Refresh</button>
+        <button class="btn btn-secondary btn-sm" onclick="loadCatalog(true)" style="width: auto;">🔄 Refresh</button>
       </div>
       
       <div id="catalogGrid" class="catalog-grid">
@@ -1100,12 +1332,15 @@ function handleDashboard(request, env) {
       }
     }
 
-    async function loadCatalog() {
+    async function loadCatalog(refresh = false) {
       const grid = document.getElementById('catalogGrid');
       const countSpan = document.getElementById('itemCount');
+      if (refresh) {
+        countSpan.innerText = 'Refreshing...';
+      }
       
       try {
-        const res = await fetch('/api/catalog?_t=' + Date.now());
+        const res = await fetch('/api/catalog?_t=' + Date.now() + (refresh ? '&refresh=1' : ''));
         const data = await res.json();
         const items = data.items || [];
         countSpan.innerText = items.length + ' item' + (items.length === 1 ? '' : 's');
@@ -1130,7 +1365,8 @@ function handleDashboard(request, env) {
                   <span>\${sizeStr}</span>
                 </div>
                 <div class="video-actions">
-                  <a href="\${streamUrl}" target="_blank" class="btn btn-secondary btn-sm">▶ Direct Stream</a>
+                  <a href="\${streamUrl}" target="_blank" class="btn btn-secondary btn-sm" style="flex: 1;">▶ Stream</a>
+                  <button class="btn btn-danger btn-sm" onclick="deleteVideo('\${item.id}', '\${(item.filename || \'\').replace(/\'/g, &quot;\\\\\'&quot;)}', '\${(item.title || \'\').replace(/\'/g, &quot;\\\\\'&quot;)}')" style="flex: 1;">🗑️ Delete</button>
                 </div>
               </div>
             </div>
@@ -1139,6 +1375,44 @@ function handleDashboard(request, env) {
       } catch (e) {
         countSpan.innerText = 'Error';
         grid.innerHTML = '<div style="grid-column: 1 / -1; text-align: center; color: var(--error); padding: 20px;">Failed to load catalog: ' + e.message + '</div>';
+      }
+    }
+
+    async function deleteVideo(id, filename, title) {
+      if (!confirm('Are you sure you want to permanently delete "' + title + '" from your Cloud Vault?')) {
+        return;
+      }
+
+      let pin = document.getElementById('adminPin').value;
+      if (!pin) {
+        pin = prompt('Enter your ADMIN_PIN to confirm deletion:');
+        if (!pin) return;
+      }
+
+      const alertBox = document.getElementById('alertBox');
+      alertBox.className = 'alert';
+      alertBox.style.display = 'flex';
+      alertBox.innerHTML = '⏳ Deleting "' + title + '" from Archive.org vault...';
+
+      try {
+        const res = await fetch('/api/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: id, filename: filename, admin_pin: pin })
+        });
+
+        const data = await res.json();
+        if (res.ok && data.success) {
+          alertBox.className = 'alert success';
+          alertBox.innerHTML = '✅ ' + data.message;
+          await loadCatalog();
+        } else {
+          alertBox.className = 'alert error';
+          alertBox.innerHTML = '❌ Delete failed: ' + (data.error || 'Unknown error');
+        }
+      } catch (err) {
+        alertBox.className = 'alert error';
+        alertBox.innerHTML = '❌ Network error: ' + err.message;
       }
     }
   </script>

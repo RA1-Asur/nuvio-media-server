@@ -11,6 +11,11 @@ IA_ITEM_ID = "nuvio-cloud-vault-2026"
 GH_OWNER = "RA1-Asur"
 GH_REPO = "nuvio-media-server"
 
+[[kv_namespaces]]
+binding = "VAULT_KV"
+id = "4e4f7bdccc48481b8aa08ddb6c77ac12"
+
+
 # Secrets configured via `wrangler secret put <NAME>`:
 # - ADMIN_PIN: Secret PIN to authenticate /dashboard ingestion requests
 # - GITHUB_PAT: GitHub Personal Access Token with repo / workflow permissions
