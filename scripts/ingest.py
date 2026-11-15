@@ -61,6 +61,11 @@ def detect_remote_title(video_url):
     except Exception as e:
         print(f"[DEBUG] Remote title detection skipped: {e}")
     return None
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Ingest video into Nuvio Internet Archive Vault")
+    parser.add_argument("--video-url", default=os.environ.get("VIDEO_URL"), help="Direct video link or URL supported by yt-dlp")
     parser.add_argument("--custom-title", default=os.environ.get("CUSTOM_TITLE"), help="Optional custom title override")
     parser.add_argument("--imdb-id", default=os.environ.get("IMDB_ID"), help="Optional IMDb ID (e.g. tt1234567)")
     parser.add_argument("--poster-url", default=os.environ.get("POSTER_URL"), help="Optional thumbnail or poster URL")
