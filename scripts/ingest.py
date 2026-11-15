@@ -254,16 +254,45 @@ def main():
         poster_url = args.poster_url
         files_to_upload = { clean_filename: target_video_path }
 
-        # Upload thumbnail to Archive.org if no custom poster provided and local thumb exists
+        # If no poster provided and no yt-dlp thumb, extract video frame via ffmpeg
+        if not poster_url and not thumb_file and shutil.which("ffmpeg"):
+            print("[INFO] No external poster found. Automatically extracting high-quality frame using ffmpeg...")
+            extracted_thumb = os.path.join(temp_dir, f"{clean_filename}_thumb.jpg")
+            seek_time = "00:00:05" if duration and duration > 10 else "00:00:01"
+            ffmpeg_cmd = [
+                "ffmpeg", "-y", "-ss", seek_time,
+                "-i", target_video_path,
+                "-vframes", "1",
+                "-q:v", "2",
+                extracted_thumb
+            ]
+            try:
+                subprocess.run(ffmpeg_cmd, capture_output=True, check=True)
+                if os.path.isfile(extracted_thumb) and os.path.getsize(extracted_thumb) > 0:
+                    thumb_file = extracted_thumb
+                    print(f"[SUCCESS] Extracted automatic video thumbnail frame: {extracted_thumb}")
+            except Exception as e:
+                print(f"[WARNING] Automatic ffmpeg frame extraction failed: {e}")
+
+        # Upload local thumbnail to Archive.org so it is permanently hosted
         if not poster_url and thumb_file and os.path.isfile(thumb_file):
             _, thumb_ext = os.path.splitext(thumb_file)
+            if not thumb_ext:
+                thumb_ext = ".jpg"
             thumb_name = f"{clean_filename}_thumb{thumb_ext}"
             thumb_target = os.path.join(temp_dir, thumb_name)
-            os.rename(thumb_file, thumb_target)
+            if thumb_file != thumb_target:
+                os.rename(thumb_file, thumb_target)
             files_to_upload[thumb_name] = thumb_target
             poster_url = f"https://archive.org/download/{ia_item_id}/{urllib.parse.quote(thumb_name)}"
+            print(f"[INFO] Using self-hosted Archive.org thumbnail: {poster_url}")
+        elif not poster_url and args.imdb_id and args.imdb_id.strip().startswith("tt"):
+            # Use Cinemeta / IMDb poster provider if IMDb ID is supplied
+            poster_url = f"https://images.metahub.space/poster/medium/{args.imdb_id.strip()}/img"
+            print(f"[INFO] Using official Cinemeta/IMDb poster: {poster_url}")
         elif not poster_url:
             poster_url = f"https://archive.org/services/img/{ia_item_id}"
+            print(f"[INFO] Fallback to Archive.org vault poster: {poster_url}")
 
         # Step 4: Upload to Internet Archive with --no-derive
         print(f"\n--- Step 3: Uploading to Internet Archive item '{ia_item_id}' ---")

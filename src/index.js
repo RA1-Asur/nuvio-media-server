@@ -40,6 +40,21 @@ const MANIFEST = {
 };
 
 /**
+ * Helper to resolve high-quality poster URL:
+ * 1. Stored poster
+ * 2. Cinemeta official IMDb poster if IMDb ID present
+ * 3. Internet Archive item banner fallback
+ */
+function resolvePoster(item, itemId) {
+  if (item && item.poster) return item.poster;
+  const imdbId = item ? (item.imdb_id || (item.id && item.id.startsWith('tt') ? item.id : null)) : null;
+  if (imdbId) {
+    return `https://images.metahub.space/poster/medium/${imdbId}/img`;
+  }
+  return `https://archive.org/services/img/${itemId || 'nuvio-cloud-vault-2026'}`;
+}
+
+/**
  * Handle incoming requests
  */
 export default {
@@ -257,11 +272,12 @@ async function handleCatalog(path, url, env) {
   const paginated = items.slice(skip, skip + 100);
 
   // Format into Nuvio MetaPreview format
+  const itemId = env.IA_ITEM_ID || 'nuvio-cloud-vault-2026';
   const metas = paginated.map((item) => ({
     id: item.id,
     type: 'movie',
     name: item.title,
-    poster: item.poster || `https://archive.org/services/img/${env.IA_ITEM_ID || 'nuvio-cloud-vault-2026'}`,
+    poster: resolvePoster(item, itemId),
     description: item.description || '',
     releaseInfo: item.releaseInfo || (item.added_at ? item.added_at.slice(0, 4) : ''),
   }));
@@ -311,12 +327,13 @@ async function handleMeta(path, env) {
     return jsonResponse({ meta: null }, 404);
   }
 
+  const posterUrl = resolvePoster(item, itemId);
   const meta = {
     id: item.id,
     type: 'movie',
     name: item.title,
-    poster: item.poster || `https://archive.org/services/img/${itemId}`,
-    background: item.poster || `https://archive.org/services/img/${itemId}`,
+    poster: posterUrl,
+    background: posterUrl,
     description: item.description || `Vault item: ${item.filename}`,
     runtime: item.duration_str || (item.duration ? `${Math.round(item.duration / 60)} min` : undefined),
     releaseInfo: item.releaseInfo || (item.added_at ? item.added_at.slice(0, 4) : ''),
