@@ -127,6 +127,11 @@ export default {
         return await handleCatalogAppend(request, env);
       }
 
+      // 10. API: Fetch recent GitHub Action ingestion runs
+      if (path === '/api/runs') {
+        return await handleGetRuns(env);
+      }
+
       // 404 Not Found
       return jsonResponse({ error: 'Endpoint not found' }, 404);
     } catch (err) {
@@ -775,6 +780,54 @@ async function handleCatalogAppend(request, env) {
 }
 
 /**
+ * Handle API Runs: Return recent GitHub Actions workflow runs
+ */
+async function handleGetRuns(env) {
+  const ghOwner = env.GH_OWNER;
+  const ghRepo = env.GH_REPO;
+  const ghPat = env.GITHUB_PAT;
+
+  if (!ghOwner || !ghRepo || !ghPat) {
+    return jsonResponse({ runs: [] });
+  }
+
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${ghOwner}/${ghRepo}/actions/runs?per_page=6`,
+      {
+        headers: {
+          'Authorization': `Bearer ${ghPat}`,
+          'Accept': 'application/vnd.github.v3+json',
+          'User-Agent': 'Nuvio-Cloudflare-Worker/1.0',
+        },
+      }
+    );
+
+    if (!res.ok) {
+      return jsonResponse({ runs: [] });
+    }
+
+    const data = await res.json();
+    const runs = (data.workflow_runs || [])
+      .filter((r) => r.name === 'Ingest Video to Cloud Vault')
+      .map((r) => ({
+        id: r.id,
+        name: r.name,
+        status: r.status,
+        conclusion: r.conclusion,
+        html_url: r.html_url,
+        created_at: r.created_at,
+        updated_at: r.updated_at,
+        run_number: r.run_number,
+      }));
+
+    return jsonResponse({ runs });
+  } catch (err) {
+    return jsonResponse({ runs: [], error: err.message });
+  }
+}
+
+/**
  * Handle Dashboard HTML UI
  */
 function handleDashboard(request, env) {
@@ -1061,6 +1114,51 @@ function handleDashboard(request, env) {
       color: #fca5a5;
     }
 
+    /* Live Ingestion Activity & Badges */
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 9999px;
+      font-size: 0.78rem;
+      font-weight: 600;
+    }
+    .badge-progress {
+      background: rgba(99, 102, 241, 0.2);
+      color: #a5b4fc;
+      border: 1px solid rgba(99, 102, 241, 0.4);
+    }
+    .badge-success {
+      background: rgba(34, 197, 94, 0.2);
+      color: #4ade80;
+      border: 1px solid rgba(34, 197, 94, 0.4);
+    }
+    .badge-failed {
+      background: rgba(239, 68, 68, 0.2);
+      color: #f87171;
+      border: 1px solid rgba(239, 68, 68, 0.4);
+    }
+    .pulse-bar {
+      width: 100%;
+      height: 4px;
+      background: rgba(255, 255, 255, 0.1);
+      border-radius: 2px;
+      overflow: hidden;
+      margin-top: 10px;
+    }
+    .pulse-bar-fill {
+      width: 45%;
+      height: 100%;
+      background: linear-gradient(90deg, #6366f1, #a855f7);
+      border-radius: 2px;
+      animation: pulseAnim 1.4s infinite ease-in-out;
+    }
+    @keyframes pulseAnim {
+      0% { transform: translateX(-100%); }
+      100% { transform: translateX(250%); }
+    }
+
     /* Catalog gallery */
     .catalog-header {
       display: flex;
@@ -1238,6 +1336,15 @@ function handleDashboard(request, env) {
       </form>
     </div>
 
+    <!-- SECTION 2.5: LIVE INGESTION ACTIVITY -->
+    <div class="card" id="activityCard" style="display: none;">
+      <div class="card-title" style="margin-bottom: 12px;">
+        <span>⚡</span>
+        <span>Ingestion Activity & Progress</span>
+      </div>
+      <div id="activityContent"></div>
+    </div>
+
     <!-- SECTION 3: VAULT CATALOG PREVIEW -->
     <div class="card">
       <div class="catalog-header">
@@ -1261,13 +1368,15 @@ function handleDashboard(request, env) {
   </div>
 
   <script>
-    // Load saved PIN on startup
+    let pollTimer = null;
+
     document.addEventListener('DOMContentLoaded', () => {
       const savedPin = localStorage.getItem('nuvio_admin_pin');
       if (savedPin) {
         document.getElementById('adminPin').value = savedPin;
       }
       loadCatalog();
+      checkActivity();
     });
 
     function copyManifest() {
@@ -1275,6 +1384,75 @@ function handleDashboard(request, env) {
       navigator.clipboard.writeText(url).then(() => {
         alert('Manifest URL copied to clipboard! Paste it into Nuvio or Stremio.');
       });
+    }
+
+    async function checkActivity() {
+      try {
+        const res = await fetch('/api/runs?_t=' + Date.now());
+        const data = await res.json();
+        const runs = data.runs || [];
+        const card = document.getElementById('activityCard');
+        const content = document.getElementById('activityContent');
+
+        if (runs.length === 0) {
+          card.style.display = 'none';
+          return;
+        }
+
+        card.style.display = 'block';
+        const activeRun = runs.find(r => r.status === 'in_progress' || r.status === 'queued');
+
+        if (activeRun) {
+          const runNum = activeRun.run_number ? ('#' + activeRun.run_number) : '';
+          content.innerHTML = \`
+            <div style="background: rgba(99, 102, 241, 0.1); border: 1px solid rgba(99, 102, 241, 0.3); border-radius: 10px; padding: 14px;">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                <span class="badge badge-progress">⏳ Ingestion in Progress \${runNum}</span>
+                <a href="\${activeRun.html_url}" target="_blank" class="btn btn-secondary btn-sm" style="padding: 4px 10px; font-size: 0.75rem;">🔗 Console Logs</a>
+              </div>
+              <div style="font-size: 0.88rem; color: var(--text-muted);">
+                Downloading video, extracting poster thumbnail, and uploading to Internet Archive vault...
+              </div>
+              <div class="pulse-bar"><div class="pulse-bar-fill"></div></div>
+            </div>
+          \`;
+
+          if (!pollTimer) {
+            pollTimer = setTimeout(async () => {
+              pollTimer = null;
+              await checkActivity();
+              await loadCatalog();
+            }, 4000);
+          }
+        } else {
+          const latest = runs[0];
+          const isSuccess = latest.conclusion === 'success';
+          const badgeClass = isSuccess ? 'badge-success' : 'badge-failed';
+          const badgeIcon = isSuccess ? '✅ Ingest Complete' : '❌ Ingest Failed';
+          const timeAgo = formatTimeAgo(latest.created_at);
+
+          content.innerHTML = \`
+            <div style="display: flex; justify-content: space-between; align-items: center; padding: 10px 0;">
+              <div>
+                <span class="badge \${badgeClass}">\${badgeIcon}</span>
+                <span style="font-size: 0.82rem; color: var(--text-muted); margin-left: 8px;">Run #\${latest.run_number} (\${timeAgo})</span>
+              </div>
+              <a href="\${latest.html_url}" target="_blank" class="btn btn-secondary btn-sm" style="padding: 4px 10px; font-size: 0.75rem;">Console Log</a>
+            </div>
+          \`;
+        }
+      } catch (_) {}
+    }
+
+    function formatTimeAgo(isoStr) {
+      if (!isoStr) return '';
+      const diffMs = Date.now() - new Date(isoStr).getTime();
+      const mins = Math.floor(diffMs / 60000);
+      if (mins < 1) return 'just now';
+      if (mins === 1) return '1 min ago';
+      if (mins < 60) return mins + ' mins ago';
+      const hours = Math.floor(mins / 60);
+      return hours + 'h ago';
     }
 
     async function handleEnqueueSubmit(e) {
@@ -1314,17 +1492,21 @@ function handleDashboard(request, env) {
 
         if (res.ok && data.success) {
           alertBox.className = 'alert success';
-          alertBox.innerHTML = '✅ <strong>Queued!</strong> ' + data.message;
+          alertBox.style.display = 'flex';
+          alertBox.innerHTML = '✅ <strong>Ingestion Triggered!</strong> ' + data.message + ' Track live progress below.';
           document.getElementById('videoUrl').value = '';
           document.getElementById('customTitle').value = '';
           document.getElementById('imdbId').value = '';
           document.getElementById('posterUrl').value = '';
+          setTimeout(checkActivity, 1500);
         } else {
           alertBox.className = 'alert error';
+          alertBox.style.display = 'flex';
           alertBox.innerHTML = '❌ <strong>Error:</strong> ' + (data.error || 'Failed to trigger ingestion');
         }
       } catch (err) {
         alertBox.className = 'alert error';
+        alertBox.style.display = 'flex';
         alertBox.innerHTML = '❌ <strong>Network Error:</strong> ' + err.message;
       } finally {
         btn.disabled = false;
@@ -1351,7 +1533,7 @@ function handleDashboard(request, env) {
         }
 
         grid.innerHTML = items.map(item => {
-          const poster = item.poster || 'https://archive.org/services/img/' + (data.itemId || '${itemId}');
+          const poster = item.poster || ('https://archive.org/services/img/' + (data.itemId || '${itemId}'));
           const sizeStr = item.size_mb ? (item.size_mb + ' MB') : '';
           const streamUrl = item.direct_stream_url || ('https://archive.org/download/' + data.itemId + '/' + encodeURIComponent(item.filename));
 
@@ -1366,7 +1548,7 @@ function handleDashboard(request, env) {
                 </div>
                 <div class="video-actions">
                   <a href="\${streamUrl}" target="_blank" class="btn btn-secondary btn-sm" style="flex: 1;">▶ Stream</a>
-                  <button class="btn btn-danger btn-sm" onclick="deleteVideo('\${item.id}', '\${(item.filename || \'\').replace(/\'/g, &quot;\\\\\'&quot;)}', '\${(item.title || \'\').replace(/\'/g, &quot;\\\\\'&quot;)}')" style="flex: 1;">🗑️ Delete</button>
+                  <button class="btn btn-danger btn-sm" onclick="onDeleteBtnClick(this)" data-id="\${encodeURIComponent(item.id)}" data-filename="\${encodeURIComponent(item.filename || '')}" data-title="\${encodeURIComponent(item.title || '')}" style="flex: 1;">🗑️ Delete</button>
                 </div>
               </div>
             </div>
@@ -1376,6 +1558,13 @@ function handleDashboard(request, env) {
         countSpan.innerText = 'Error';
         grid.innerHTML = '<div style="grid-column: 1 / -1; text-align: center; color: var(--error); padding: 20px;">Failed to load catalog: ' + e.message + '</div>';
       }
+    }
+
+    function onDeleteBtnClick(btn) {
+      const id = decodeURIComponent(btn.getAttribute('data-id') || '');
+      const filename = decodeURIComponent(btn.getAttribute('data-filename') || '');
+      const title = decodeURIComponent(btn.getAttribute('data-title') || '');
+      deleteVideo(id, filename, title);
     }
 
     async function deleteVideo(id, filename, title) {
@@ -1404,14 +1593,17 @@ function handleDashboard(request, env) {
         const data = await res.json();
         if (res.ok && data.success) {
           alertBox.className = 'alert success';
+          alertBox.style.display = 'flex';
           alertBox.innerHTML = '✅ ' + data.message;
           await loadCatalog();
         } else {
           alertBox.className = 'alert error';
+          alertBox.style.display = 'flex';
           alertBox.innerHTML = '❌ Delete failed: ' + (data.error || 'Unknown error');
         }
       } catch (err) {
         alertBox.className = 'alert error';
+        alertBox.style.display = 'flex';
         alertBox.innerHTML = '❌ Network error: ' + err.message;
       }
     }
