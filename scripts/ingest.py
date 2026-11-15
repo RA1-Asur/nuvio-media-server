@@ -102,6 +102,7 @@ def download_video(video_url, temp_dir):
         "--merge-output-format", "mp4",
         "-o", out_tmpl,
         "--no-check-certificates",
+        "--extractor-args", "youtube:player_client=android,web,ios",
         video_url
     ]
 

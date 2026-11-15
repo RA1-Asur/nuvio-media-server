@@ -20,13 +20,24 @@ const MANIFEST = {
   name: 'Nuvio Cloud Vault',
   description: 'Zero-Cost Automated Video Vault & Streaming Addon powered by Internet Archive',
   resources: ['catalog', 'meta', 'stream'],
-  types: ['movie'],
+  types: ['movie', 'other', 'series'],
   idPrefixes: ['ia_', 'tt'],
   catalogs: [
     {
       type: 'movie',
       id: 'ia_vault',
       name: 'Cloud Vault Archive',
+      posterShape: 'landscape',
+      extra: [
+        { name: 'search', isRequired: false },
+        { name: 'skip', isRequired: false },
+      ],
+    },
+    {
+      type: 'other',
+      id: 'ia_vault_other',
+      name: 'Cloud Vault Videos',
+      posterShape: 'landscape',
       extra: [
         { name: 'search', isRequired: false },
         { name: 'skip', isRequired: false },
@@ -132,38 +143,106 @@ function jsonResponse(data, status = 200, extraHeaders = {}) {
 
 /**
  * Fetch catalog index from Internet Archive item
- * Falls back to Archive.org metadata API if catalog_index.json is missing
+ * Cross-references with live Archive.org metadata so if a file is deleted
+ * from Archive.org, it automatically disappears from the Nuvio catalogue!
  */
 async function fetchCatalog(env) {
   const itemId = env.IA_ITEM_ID || 'nuvio-cloud-vault-2026';
-  // Cache-busting query parameter ensures real-time updates when new videos are added
   const catalogUrl = `https://archive.org/download/${itemId}/catalog_index.json?_t=${Date.now()}`;
+  const metadataUrl = `https://archive.org/metadata/${itemId}`;
 
   try {
-    const res = await fetch(catalogUrl, {
-      headers: {
-        'User-Agent': 'Nuvio-Cloudflare-Worker/1.0',
-        'Cache-Control': 'no-cache, no-store, must-revalidate',
-        'Pragma': 'no-cache',
-      },
-      cf: { cacheTtl: 0, cacheEverything: false },
-    });
+    const [catRes, metaRes] = await Promise.allSettled([
+      fetch(catalogUrl, {
+        headers: {
+          'User-Agent': 'Nuvio-Cloudflare-Worker/1.0',
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
+          'Pragma': 'no-cache',
+        },
+        cf: { cacheTtl: 0, cacheEverything: false },
+      }),
+      fetch(metadataUrl, {
+        headers: { 'User-Agent': 'Nuvio-Cloudflare-Worker/1.0' },
+        cf: { cacheTtl: 10, cacheEverything: false },
+      }),
+    ]);
 
-    if (res.ok) {
-      const data = await res.json();
-      if (Array.isArray(data)) {
-        return { version: 1, items: data, itemId };
+    let activeFilenames = null;
+    let fallbackFiles = [];
+
+    if (metaRes.status === 'fulfilled' && metaRes.value.ok) {
+      try {
+        const metaJson = await metaRes.value.json();
+        if (Array.isArray(metaJson.files)) {
+          activeFilenames = new Set(metaJson.files.map((f) => f.name));
+          fallbackFiles = metaJson.files;
+        }
+      } catch (_) {}
+    }
+
+    if (catRes.status === 'fulfilled' && catRes.value.ok) {
+      const data = await catRes.value.json();
+      let rawItems = Array.isArray(data)
+        ? data
+        : data && Array.isArray(data.items)
+        ? data.items
+        : [];
+
+      // If live file list is available, filter out any files deleted from Archive.org!
+      if (activeFilenames && activeFilenames.size > 0) {
+        rawItems = rawItems.filter((item) => activeFilenames.has(item.filename));
       }
-      if (data && Array.isArray(data.items)) {
-        return { version: data.version || 1, items: data.items, itemId };
-      }
+
+      return { version: 1, items: rawItems, itemId };
+    }
+
+    // Fallback: parse directly from archive metadata
+    if (fallbackFiles.length > 0) {
+      return parseArchiveFiles(fallbackFiles, itemId);
     }
   } catch (e) {
-    console.warn('catalog_index.json fetch failed, falling back to archive metadata:', e.message);
+    console.warn('fetchCatalog error:', e.message);
   }
 
-  // Fallback: Parse Archive.org item metadata directly
   return await fetchArchiveMetadataFallback(itemId);
+}
+
+/**
+ * Build catalog items directly from Archive.org file list
+ */
+function parseArchiveFiles(files, itemId) {
+  const validExts = ['.mp4', '.mkv', '.webm', '.avi', '.mov', '.m4v'];
+  const items = files
+    .filter((f) => {
+      const name = (f.name || '').toLowerCase();
+      return (
+        validExts.some((ext) => name.endsWith(ext)) &&
+        !name.endsWith('_archive.torrent') &&
+        !name.endsWith('_meta.xml')
+      );
+    })
+    .map((f) => {
+      const baseName = f.name.replace(/\.[^/.]+$/, '');
+      const cleanTitle = baseName.replace(/_+/g, ' ').trim();
+      const safeId = 'ia_' + encodeBase64Url(f.name);
+      const sizeBytes = parseInt(f.size, 10) || 0;
+      const sizeMb = sizeBytes > 0 ? (sizeBytes / (1024 * 1024)).toFixed(1) : undefined;
+
+      return {
+        id: safeId,
+        title: cleanTitle,
+        filename: f.name,
+        direct_stream_url: `https://archive.org/download/${itemId}/${encodeURIComponent(f.name)}`,
+        poster: `https://archive.org/services/img/${itemId}`,
+        posterShape: 'landscape',
+        description: `Direct archive stream of ${f.name} from item ${itemId}`,
+        size_bytes: sizeBytes,
+        size_mb: sizeMb ? parseFloat(sizeMb) : null,
+        added_at: f.mtime ? new Date(parseInt(f.mtime, 10) * 1000).toISOString() : new Date().toISOString(),
+      };
+    });
+
+  return { version: 1, items, itemId };
 }
 
 /**
@@ -174,7 +253,7 @@ async function fetchArchiveMetadataFallback(itemId) {
   try {
     const res = await fetch(metaUrl, {
       headers: { 'User-Agent': 'Nuvio-Cloudflare-Worker/1.0' },
-      cf: { cacheTtl: 60, cacheEverything: true },
+      cf: { cacheTtl: 10, cacheEverything: false },
     });
 
     if (!res.ok) {
@@ -182,39 +261,7 @@ async function fetchArchiveMetadataFallback(itemId) {
     }
 
     const data = await res.json();
-    const files = data.files || [];
-    const validExts = ['.mp4', '.mkv', '.webm', '.avi', '.mov', '.m4v'];
-
-    const items = files
-      .filter((f) => {
-        const name = (f.name || '').toLowerCase();
-        return (
-          validExts.some((ext) => name.endsWith(ext)) &&
-          !name.endsWith('_archive.torrent') &&
-          !name.endsWith('_meta.xml')
-        );
-      })
-      .map((f) => {
-        const baseName = f.name.replace(/\.[^/.]+$/, '');
-        const cleanTitle = baseName.replace(/_+/g, ' ').trim();
-        const safeId = 'ia_' + encodeBase64Url(f.name);
-        const sizeBytes = parseInt(f.size, 10) || 0;
-        const sizeMb = sizeBytes > 0 ? (sizeBytes / (1024 * 1024)).toFixed(1) : undefined;
-
-        return {
-          id: safeId,
-          title: cleanTitle,
-          filename: f.name,
-          direct_stream_url: `https://archive.org/download/${itemId}/${encodeURIComponent(f.name)}`,
-          poster: `https://archive.org/services/img/${itemId}`,
-          description: `Direct archive stream of ${f.name} from item ${itemId}`,
-          size_bytes: sizeBytes,
-          size_mb: sizeMb ? parseFloat(sizeMb) : null,
-          added_at: f.mtime ? new Date(parseInt(f.mtime, 10) * 1000).toISOString() : new Date().toISOString(),
-        };
-      });
-
-    return { version: 1, items, itemId };
+    return parseArchiveFiles(data.files || [], itemId);
   } catch (err) {
     console.error('Archive metadata fallback error:', err);
     return { version: 1, items: [], itemId };
@@ -239,12 +286,9 @@ function decodeBase64Url(str) {
 }
 
 /**
- * Handle Catalog Request (/catalog/movie/ia_vault.json or with extra parameters)
+ * Handle Catalog Request (/catalog/:type/:id.json or with extra parameters)
  */
 async function handleCatalog(path, url, env) {
-  // Stremio passes path like: /catalog/movie/ia_vault.json
-  // or /catalog/movie/ia_vault/search=query.json
-  // or /catalog/movie/ia_vault/skip=10.json
   const catalog = await fetchCatalog(env);
   let items = [...catalog.items];
 
@@ -252,7 +296,8 @@ async function handleCatalog(path, url, env) {
   let search = url.searchParams.get('search') || '';
   let skip = parseInt(url.searchParams.get('skip') || '0', 10);
 
-  const cleanPath = path.replace(/^\/catalog\/movie\/ia_vault\/?/, '').replace(/\.json$/, '');
+  // Clean path removes /catalog/<type>/<id> prefix
+  const cleanPath = path.replace(/^\/catalog\/[^/]+\/[^/.]+\/?/, '').replace(/\.json$/, '');
   if (cleanPath) {
     const parts = cleanPath.split('&');
     for (const part of parts) {
@@ -278,13 +323,14 @@ async function handleCatalog(path, url, env) {
   // Apply pagination
   const paginated = items.slice(skip, skip + 100);
 
-  // Format into Nuvio MetaPreview format
+  // Format into Nuvio MetaPreview format with explicit landscape shape
   const itemId = env.IA_ITEM_ID || 'nuvio-cloud-vault-2026';
   const metas = paginated.map((item) => ({
     id: item.id,
-    type: 'movie',
+    type: item.type || 'movie',
     name: item.title,
     poster: resolvePoster(item, itemId),
+    posterShape: 'landscape',
     description: item.description || '',
     releaseInfo: item.releaseInfo || (item.added_at ? item.added_at.slice(0, 4) : ''),
   }));
@@ -293,11 +339,10 @@ async function handleCatalog(path, url, env) {
 }
 
 /**
- * Handle Meta Request (/meta/movie/:id.json)
+ * Handle Meta Request (/meta/:type/:id.json)
  */
 async function handleMeta(path, env) {
-  // Expected path: /meta/movie/:id.json
-  const match = path.match(/^\/meta\/movie\/(.+?)\.json$/);
+  const match = path.match(/^\/meta\/[^/]+\/(.+?)\.json$/);
   if (!match) {
     return jsonResponse({ meta: null }, 404);
   }
@@ -337,10 +382,11 @@ async function handleMeta(path, env) {
   const posterUrl = resolvePoster(item, itemId);
   const meta = {
     id: item.id,
-    type: 'movie',
+    type: item.type || 'movie',
     name: item.title,
     poster: posterUrl,
     background: posterUrl,
+    posterShape: 'landscape',
     description: item.description || `Vault item: ${item.filename}`,
     runtime: item.duration_str || (item.duration ? `${Math.round(item.duration / 60)} min` : undefined),
     releaseInfo: item.releaseInfo || (item.added_at ? item.added_at.slice(0, 4) : ''),
@@ -350,11 +396,10 @@ async function handleMeta(path, env) {
 }
 
 /**
- * Handle Stream Request (/stream/movie/:id.json)
+ * Handle Stream Request (/stream/:type/:id.json)
  */
 async function handleStream(path, env) {
-  // Expected path: /stream/movie/:id.json
-  const match = path.match(/^\/stream\/movie\/(.+?)\.json$/);
+  const match = path.match(/^\/stream\/[^/]+\/(.+?)\.json$/);
   if (!match) {
     return jsonResponse({ streams: [] }, 404);
   }
@@ -796,7 +841,7 @@ function handleDashboard(request, env) {
 
     .catalog-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
       gap: 16px;
     }
 
@@ -817,7 +862,7 @@ function handleDashboard(request, env) {
 
     .video-poster {
       width: 100%;
-      height: 240px;
+      aspect-ratio: 16 / 9;
       object-fit: cover;
       background: #1e1b4b;
     }
@@ -874,8 +919,8 @@ function handleDashboard(request, env) {
     @media (max-width: 640px) {
       .form-grid { grid-template-columns: 1fr; }
       .full-width { grid-column: span 1; }
-      .catalog-grid { grid-template-columns: repeat(2, 1fr); }
-      .video-poster { height: 180px; }
+      .catalog-grid { grid-template-columns: 1fr; }
+      .video-poster { aspect-ratio: 16 / 9; }
     }
   </style>
 </head>
