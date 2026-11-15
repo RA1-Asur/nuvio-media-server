@@ -1,0 +1,62 @@
+name: Ingest Video to Cloud Vault
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "Direct video link or URL supported by yt-dlp"
+        required: true
+        type: string
+      custom_title:
+        description: "Optional custom title override"
+        required: false
+        type: string
+      imdb_id:
+        description: "Optional IMDb ID (e.g. tt1234567)"
+        required: false
+        type: string
+      poster_url:
+        description: "Optional poster/thumbnail URL"
+        required: false
+        type: string
+
+  repository_dispatch:
+    types: [ingest_video]
+
+jobs:
+  ingest:
+    name: Download & Ingest Video
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install System Dependencies (aria2 & ffmpeg)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2 ffmpeg
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Video Ingestion Engine
+        env:
+          IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
+          IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
+          IA_ITEM_ID: ${{ vars.IA_ITEM_ID || secrets.IA_ITEM_ID || 'nuvio-cloud-vault-2026' }}
+          VIDEO_URL: ${{ github.event.inputs.video_url || github.event.client_payload.video_url }}
+          CUSTOM_TITLE: ${{ github.event.inputs.custom_title || github.event.client_payload.custom_title }}
+          IMDB_ID: ${{ github.event.inputs.imdb_id || github.event.client_payload.imdb_id }}
+          POSTER_URL: ${{ github.event.inputs.poster_url || github.event.client_payload.poster_url }}
+        run: |
+          python scripts/ingest.py

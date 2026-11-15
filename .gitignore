@@ -1,0 +1,22 @@
+# Environment & Credentials
+.env
+.env.local
+.env.*.local
+
+# Node & Cloudflare
+node_modules/
+.wrangler/
+dist/
+
+# Python & Temporary Files
+__pycache__/
+*.pyc
+*.pyo
+downloads/
+catalog_index.json
+*.info.json
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

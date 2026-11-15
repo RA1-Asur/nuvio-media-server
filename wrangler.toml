@@ -1,0 +1,16 @@
+name = "nuvio-media-server"
+main = "src/index.js"
+compatibility_date = "2024-03-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+# Internet Archive Item Identifier where videos and catalog_index.json are stored
+IA_ITEM_ID = "nuvio-cloud-vault-2026"
+
+# GitHub repository details for repository_dispatch trigger
+GH_OWNER = "your-github-username"
+GH_REPO = "nuvio-media-server"
+
+# Secrets configured via `wrangler secret put <NAME>`:
+# - ADMIN_PIN: Secret PIN to authenticate /dashboard ingestion requests
+# - GITHUB_PAT: GitHub Personal Access Token with repo / workflow permissions
