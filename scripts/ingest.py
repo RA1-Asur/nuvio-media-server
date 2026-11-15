@@ -16,6 +16,8 @@ import shutil
 import hashlib
 import argparse
 import urllib.parse
+import urllib.request
+import ssl
 from datetime import datetime, timezone
 import subprocess
 
@@ -32,7 +34,33 @@ except ImportError:
     sys.exit(1)
 
 
-def parse_args():
+def detect_remote_title(video_url):
+    """
+    Attempts to extract human-readable title from Content-Disposition header
+    when downloading direct video files.
+    """
+    try:
+        req = urllib.request.Request(
+            video_url, 
+            method="HEAD", 
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        )
+        # Avoid SSL certificate validation issues on legacy environments
+        ctx = ssl._create_unverified_context()
+        with urllib.request.urlopen(req, context=ctx, timeout=8) as resp:
+            cd = resp.headers.get("Content-Disposition", "")
+            if cd:
+                match = re.search(r'filename\*?=(?:UTF-8\'\')?\"?([^\";]+)\"?', cd, re.IGNORECASE)
+                if match:
+                    raw_fn = match.group(1).strip()
+                    title = re.sub(r'\.[a-zA-Z0-9]+$', '', raw_fn)
+                    clean_title = re.sub(r'[_.]+', ' ', title).strip()
+                    if clean_title:
+                        print(f"[INFO] Extracted title from Content-Disposition header: '{clean_title}'")
+                        return clean_title
+    except Exception as e:
+        print(f"[DEBUG] Remote title detection skipped: {e}")
+    return None
     parser = argparse.ArgumentParser(description="Ingest video into Nuvio Internet Archive Vault")
     parser.add_argument("--video-url", default=os.environ.get("VIDEO_URL"), help="Direct video link or URL supported by yt-dlp")
     parser.add_argument("--custom-title", default=os.environ.get("CUSTOM_TITLE"), help="Optional custom title override")
@@ -231,7 +259,9 @@ def main():
         video_file, info_data, thumb_file = download_video(args.video_url, temp_dir)
 
         raw_title = info_data.get("title") or "Vault Video"
-        title = (args.custom_title or raw_title).strip()
+        # Check if remote Content-Disposition provided a richer title for direct file links
+        remote_title = detect_remote_title(args.video_url) if not args.custom_title else None
+        title = (args.custom_title or remote_title or raw_title).strip()
         duration = info_data.get("duration") or 0
         description = (info_data.get("description") or f"Uploaded to {ia_item_id}").strip()
         resolution = f"{info_data.get('width', '')}x{info_data.get('height', '')}" if info_data.get('width') else (info_data.get('resolution') or "HD")

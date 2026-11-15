@@ -121,7 +121,9 @@ function jsonResponse(data, status = 200, extraHeaders = {}) {
     status,
     headers: {
       'Content-Type': 'application/json; charset=utf-8',
-      'Cache-Control': 'public, max-age=60, stale-while-revalidate=300',
+      'Cache-Control': 'no-cache, no-store, must-revalidate, max-age=0',
+      'Pragma': 'no-cache',
+      'Expires': '0',
       ...CORS_HEADERS,
       ...extraHeaders,
     },
@@ -134,12 +136,17 @@ function jsonResponse(data, status = 200, extraHeaders = {}) {
  */
 async function fetchCatalog(env) {
   const itemId = env.IA_ITEM_ID || 'nuvio-cloud-vault-2026';
-  const catalogUrl = `https://archive.org/download/${itemId}/catalog_index.json`;
+  // Cache-busting query parameter ensures real-time updates when new videos are added
+  const catalogUrl = `https://archive.org/download/${itemId}/catalog_index.json?_t=${Date.now()}`;
 
   try {
     const res = await fetch(catalogUrl, {
-      headers: { 'User-Agent': 'Nuvio-Cloudflare-Worker/1.0' },
-      cf: { cacheTtl: 30, cacheEverything: true },
+      headers: {
+        'User-Agent': 'Nuvio-Cloudflare-Worker/1.0',
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        'Pragma': 'no-cache',
+      },
+      cf: { cacheTtl: 0, cacheEverything: false },
     });
 
     if (res.ok) {
@@ -1053,7 +1060,7 @@ function handleDashboard(request, env) {
       const countSpan = document.getElementById('itemCount');
       
       try {
-        const res = await fetch('/api/catalog');
+        const res = await fetch('/api/catalog?_t=' + Date.now());
         const data = await res.json();
         const items = data.items || [];
         countSpan.innerText = items.length + ' item' + (items.length === 1 ? '' : 's');
