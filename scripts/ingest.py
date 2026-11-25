@@ -182,12 +182,10 @@ def sanitize_filename(title, original_path):
 
 def sync_catalog_index(ia_item_id, access_key, secret_key, new_entry):
     """
-    Downloads existing catalog_index.json from Internet Archive,
-    updates it with new video metadata, and re-uploads it.
+    Downloads existing catalog_index.json from Internet Archive and Cloudflare Worker,
+    merges with all existing items, updates it with new video metadata, and re-uploads it.
     """
-    catalog_url = f"https://archive.org/download/{ia_item_id}/catalog_index.json"
-    print(f"[INFO] Fetching catalog index from: {catalog_url}")
-
+    worker_url = os.environ.get("WORKER_URL", "https://nuvio-media-server.deepanshmahawar0.workers.dev")
     catalog = {
         "version": 1,
         "item_id": ia_item_id,
@@ -195,28 +193,59 @@ def sync_catalog_index(ia_item_id, access_key, secret_key, new_entry):
         "items": []
     }
 
+    existing_items_map = {}
+
+    # 1. Fetch from Cloudflare Worker KV (ultra-fast and non-cached)
     try:
-        res = requests.get(catalog_url, timeout=15)
-        if res.status_code == 200:
-            existing_data = res.json()
-            if isinstance(existing_data, dict) and "items" in existing_data:
-                catalog["items"] = existing_data["items"]
-            elif isinstance(existing_data, list):
-                catalog["items"] = existing_data
-            print(f"[INFO] Successfully loaded existing catalog ({len(catalog['items'])} items).")
-        else:
-            print(f"[INFO] catalog_index.json not found on Archive.org (HTTP {res.status_code}). Initializing new catalog.")
+        worker_res = requests.get(f"{worker_url}/api/catalog?_t={int(time.time())}", timeout=10)
+        if worker_res.status_code == 200:
+            w_data = worker_res.json()
+            items_list = w_data.get("items", []) if isinstance(w_data, dict) else (w_data if isinstance(w_data, list) else [])
+            for it in items_list:
+                if it.get("filename"):
+                    existing_items_map[it["filename"]] = it
+            print(f"[INFO] Loaded {len(existing_items_map)} existing items from Cloudflare Worker catalog.")
     except Exception as e:
-        print(f"[WARNING] Could not fetch catalog_index.json ({e}). Starting fresh.")
+        print(f"[DEBUG] Could not fetch from Worker catalog: {e}")
 
-    # Remove duplicates matching ID or filename
-    catalog["items"] = [
-        item for item in catalog["items"] 
-        if item.get("id") != new_entry["id"] and item.get("filename") != new_entry["filename"]
-    ]
+    # 2. Fetch from Archive.org metadata to discover any items on disk
+    try:
+        meta_url = f"https://archive.org/metadata/{ia_item_id}"
+        meta_res = requests.get(meta_url, timeout=12)
+        if meta_res.status_code == 200:
+            m_data = meta_res.json()
+            files = m_data.get("files", [])
+            file_names = {f["name"] for f in files}
+            video_exts = (".mp4", ".mkv", ".webm", ".avi", ".mov")
+            for f in files:
+                fname = f.get("name", "")
+                if fname.lower().endswith(video_exts) and fname not in existing_items_map:
+                    thumb_name = f"{fname}_thumb.jpg"
+                    poster = f"https://archive.org/download/{ia_item_id}/{thumb_name}" if thumb_name in file_names else f"https://archive.org/services/img/{ia_item_id}"
+                    sz = int(f.get("size", 0))
+                    existing_items_map[fname] = {
+                        "id": f"ia_{hashlib.md5(fname.encode('utf-8')).hexdigest()[:8]}",
+                        "imdb_id": None,
+                        "title": re.sub(r'_[a-f0-9]{8}\.[a-zA-Z0-9]+$', '', fname).replace('_', ' ').strip(),
+                        "filename": fname,
+                        "direct_stream_url": f"https://archive.org/download/{ia_item_id}/{fname}",
+                        "poster": poster,
+                        "description": f"Uploaded to {ia_item_id}",
+                        "duration": 0,
+                        "duration_str": "Unknown",
+                        "size_bytes": sz,
+                        "size_mb": round(sz / (1024 * 1024), 2),
+                        "resolution": "HD",
+                        "added_at": datetime.now(timezone.utc).isoformat()
+                    }
+    except Exception as e:
+        print(f"[DEBUG] Metadata discovery skipped: {e}")
 
-    # Prepend new entry so newest videos appear first
-    catalog["items"].insert(0, new_entry)
+    # 3. Add or update new entry
+    existing_items_map[new_entry["filename"]] = new_entry
+
+    catalog["items"] = list(existing_items_map.values())
+    catalog["items"].sort(key=lambda x: x.get("added_at", ""), reverse=True)
     catalog["updated_at"] = datetime.now(timezone.utc).isoformat()
 
     local_catalog_path = "catalog_index.json"
@@ -229,16 +258,15 @@ def sync_catalog_index(ia_item_id, access_key, secret_key, new_entry):
         files={ "catalog_index.json": local_catalog_path },
         access_key=access_key,
         secret_key=secret_key,
-        headers={"x-archive-no-derive": "1"},
+        headers={"x-archive-no-derive": "1", "x-archive-keep-old-version": "0"},
         queue_derive=False,
         retries=5,
         verbose=True
     )
-    print("[SUCCESS] catalog_index.json synchronized on Internet Archive.")
+    print(f"[SUCCESS] catalog_index.json synchronized on Internet Archive with {len(catalog['items'])} items.")
 
-    # Notify Cloudflare Worker to update KV immediately
-    worker_url = os.environ.get("WORKER_URL", "https://nuvio-media-server.deepanshmahawar0.workers.dev")
-    admin_pin = os.environ.get("ADMIN_PIN")
+    # 4. Notify Cloudflare Worker to update KV immediately
+    admin_pin = os.environ.get("ADMIN_PIN") or "Aa@1268391680"
     if worker_url and admin_pin:
         try:
             print(f"[INFO] Notifying Cloudflare Worker KV ({worker_url}/api/catalog/append)...")

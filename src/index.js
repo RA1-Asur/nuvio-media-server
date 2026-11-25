@@ -192,7 +192,7 @@ async function fetchCatalog(env, forceRefresh = false) {
       }),
       fetch(metadataUrl, {
         headers: { 'User-Agent': 'Nuvio-Cloudflare-Worker/1.0' },
-        cf: { cacheTtl: 10, cacheEverything: false },
+        cf: { cacheTtl: 0, cacheEverything: false },
       }),
     ]);
 
@@ -209,26 +209,44 @@ async function fetchCatalog(env, forceRefresh = false) {
       } catch (_) {}
     }
 
-    let catalogResult = null;
-    if (catRes.status === 'fulfilled' && catRes.value.ok) {
-      const data = await catRes.value.json();
-      let rawItems = Array.isArray(data)
-        ? data
-        : data && Array.isArray(data.items)
-        ? data.items
-        : [];
+    // Build base item list directly from live Archive.org metadata
+    const metadataCatalog = fallbackFiles.length > 0 ? parseArchiveFiles(fallbackFiles, itemId) : { items: [] };
+    const itemsMap = new Map();
 
-      // If live file list is available, filter out any files deleted from Archive.org!
-      if (activeFilenames && activeFilenames.size > 0) {
-        rawItems = rawItems.filter((item) => activeFilenames.has(item.filename));
-      }
-
-      catalogResult = { version: 1, items: rawItems, itemId };
-    } else if (fallbackFiles.length > 0) {
-      catalogResult = parseArchiveFiles(fallbackFiles, itemId);
+    // 1. Seed with all video files from metadata (ensures 100% of uploaded videos are present)
+    for (const it of metadataCatalog.items) {
+      if (it.filename) itemsMap.set(it.filename, it);
     }
 
-    if (catalogResult) {
+    // 2. Overlay any richer metadata from catalog_index.json
+    if (catRes.status === 'fulfilled' && catRes.value.ok) {
+      try {
+        const data = await catRes.value.json();
+        const rawItems = Array.isArray(data)
+          ? data
+          : data && Array.isArray(data.items)
+          ? data.items
+          : [];
+        for (const it of rawItems) {
+          if (it.filename) {
+            const existing = itemsMap.get(it.filename) || {};
+            itemsMap.set(it.filename, { ...existing, ...it });
+          }
+        }
+      } catch (_) {}
+    }
+
+    // 3. Filter out any files deleted from Archive.org
+    let finalItems = Array.from(itemsMap.values());
+    if (activeFilenames && activeFilenames.size > 0) {
+      finalItems = finalItems.filter((item) => activeFilenames.has(item.filename));
+    }
+
+    // Sort newest first
+    finalItems.sort((a, b) => new Date(b.added_at || 0) - new Date(a.added_at || 0));
+
+    if (finalItems.length > 0) {
+      const catalogResult = { version: 1, items: finalItems, itemId };
       if (env.VAULT_KV) {
         try {
           await env.VAULT_KV.put('catalog', JSON.stringify(catalogResult));
@@ -254,6 +272,8 @@ async function fetchCatalog(env, forceRefresh = false) {
  */
 function parseArchiveFiles(files, itemId) {
   const validExts = ['.mp4', '.mkv', '.webm', '.avi', '.mov', '.m4v'];
+  const fileNameSet = new Set(files.map((f) => f.name));
+
   const items = files
     .filter((f) => {
       const name = (f.name || '').toLowerCase();
@@ -264,22 +284,32 @@ function parseArchiveFiles(files, itemId) {
       );
     })
     .map((f) => {
-      const baseName = f.name.replace(/\.[^/.]+$/, '');
-      const cleanTitle = baseName.replace(/_+/g, ' ').trim();
-      const safeId = 'ia_' + encodeBase64Url(f.name);
+      const fname = f.name;
+      const hashMatch = fname.match(/_([a-f0-9]{8})\.[a-zA-Z0-9]+$/);
+      const safeId = hashMatch ? `ia_${hashMatch[1]}` : 'ia_' + encodeBase64Url(fname);
+      const rawTitle = hashMatch ? fname.substring(0, hashMatch.index) : fname.replace(/\.[^/.]+$/, '');
+      const cleanTitle = rawTitle.replace(/_+/g, ' ').trim();
       const sizeBytes = parseInt(f.size, 10) || 0;
-      const sizeMb = sizeBytes > 0 ? (sizeBytes / (1024 * 1024)).toFixed(1) : undefined;
+      const sizeMb = sizeBytes > 0 ? parseFloat((sizeBytes / (1024 * 1024)).toFixed(2)) : null;
+
+      const thumbName = `${fname}_thumb.jpg`;
+      const poster = fileNameSet.has(thumbName)
+        ? `https://archive.org/download/${itemId}/${encodeURIComponent(thumbName)}`
+        : `https://archive.org/services/img/${itemId}`;
 
       return {
         id: safeId,
         title: cleanTitle,
-        filename: f.name,
-        direct_stream_url: `https://archive.org/download/${itemId}/${encodeURIComponent(f.name)}`,
-        poster: `https://archive.org/services/img/${itemId}`,
+        filename: fname,
+        direct_stream_url: `https://archive.org/download/${itemId}/${encodeURIComponent(fname)}`,
+        poster: poster,
         posterShape: 'landscape',
-        description: `Direct archive stream of ${f.name} from item ${itemId}`,
+        description: `Uploaded to ${itemId}`,
+        duration: 0,
+        duration_str: 'Unknown',
         size_bytes: sizeBytes,
-        size_mb: sizeMb ? parseFloat(sizeMb) : null,
+        size_mb: sizeMb,
+        resolution: 'HD',
         added_at: f.mtime ? new Date(parseInt(f.mtime, 10) * 1000).toISOString() : new Date().toISOString(),
       };
     });
