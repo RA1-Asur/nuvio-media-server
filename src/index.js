@@ -165,10 +165,11 @@ function jsonResponse(data, status = 200, extraHeaders = {}) {
  */
 async function fetchCatalog(env, forceRefresh = false) {
   // 1. Check Cloudflare KV for ultra-fast instant catalog
-  if (!forceRefresh && env.VAULT_KV) {
+  let cached = null;
+  if (env.VAULT_KV) {
     try {
-      const cached = await env.VAULT_KV.get('catalog', 'json');
-      if (cached && Array.isArray(cached.items)) {
+      cached = await env.VAULT_KV.get('catalog', 'json');
+      if (!forceRefresh && cached && Array.isArray(cached.items) && cached.items.length > 0) {
         return cached;
       }
     } catch (e) {
@@ -181,6 +182,17 @@ async function fetchCatalog(env, forceRefresh = false) {
   const metadataUrl = `https://archive.org/metadata/${itemId}`;
 
   try {
+    const itemsMap = new Map();
+
+    // 1. Seed with existing KV items (KV is the permanent master state for uploaded videos)
+    if (cached && Array.isArray(cached.items)) {
+      for (const it of cached.items) {
+        if (it && it.filename) {
+          itemsMap.set(it.filename, it);
+        }
+      }
+    }
+
     const [catRes, metaRes] = await Promise.allSettled([
       fetch(catalogUrl, {
         headers: {
@@ -196,29 +208,22 @@ async function fetchCatalog(env, forceRefresh = false) {
       }),
     ]);
 
-    let activeFilenames = null;
-    let fallbackFiles = [];
-
+    // 2. Discover any items on Archive.org metadata
     if (metaRes.status === 'fulfilled' && metaRes.value.ok) {
       try {
         const metaJson = await metaRes.value.json();
         if (Array.isArray(metaJson.files)) {
-          activeFilenames = new Set(metaJson.files.map((f) => f.name));
-          fallbackFiles = metaJson.files;
+          const discovered = parseArchiveFiles(metaJson.files, itemId);
+          for (const it of discovered.items) {
+            if (it.filename && !itemsMap.has(it.filename)) {
+              itemsMap.set(it.filename, it);
+            }
+          }
         }
       } catch (_) {}
     }
 
-    // Build base item list directly from live Archive.org metadata
-    const metadataCatalog = fallbackFiles.length > 0 ? parseArchiveFiles(fallbackFiles, itemId) : { items: [] };
-    const itemsMap = new Map();
-
-    // 1. Seed with all video files from metadata (ensures 100% of uploaded videos are present)
-    for (const it of metadataCatalog.items) {
-      if (it.filename) itemsMap.set(it.filename, it);
-    }
-
-    // 2. Overlay any richer metadata from catalog_index.json
+    // 3. Overlay any richer metadata from catalog_index.json
     if (catRes.status === 'fulfilled' && catRes.value.ok) {
       try {
         const data = await catRes.value.json();
@@ -236,13 +241,7 @@ async function fetchCatalog(env, forceRefresh = false) {
       } catch (_) {}
     }
 
-    // 3. Filter out any files deleted from Archive.org
     let finalItems = Array.from(itemsMap.values());
-    if (activeFilenames && activeFilenames.size > 0) {
-      finalItems = finalItems.filter((item) => activeFilenames.has(item.filename));
-    }
-
-    // Sort newest first
     finalItems.sort((a, b) => new Date(b.added_at || 0) - new Date(a.added_at || 0));
 
     if (finalItems.length > 0) {
@@ -256,6 +255,10 @@ async function fetchCatalog(env, forceRefresh = false) {
     }
   } catch (e) {
     console.warn('fetchCatalog error:', e.message);
+  }
+
+  if (cached && Array.isArray(cached.items) && cached.items.length > 0) {
+    return cached;
   }
 
   const fallback = await fetchArchiveMetadataFallback(itemId);
@@ -1030,8 +1033,13 @@ async function handleGetRuns(env) {
 
     const data = await res.json();
     const runsList = (data.workflow_runs || [])
-      .filter((r) => r.name === 'Ingest Video to Cloud Vault')
-      .slice(0, 8);
+      .filter((r) =>
+        r.workflow_id === 419200585 ||
+        (r.path && r.path.includes('ingest_video.yml')) ||
+        r.name === 'Ingest Video to Cloud Vault' ||
+        (r.name && r.name.startsWith('Ingest'))
+      )
+      .slice(0, 10);
 
     const runs = await Promise.all(
       runsList.map((r) => enrichRunDetails(r, ghOwner, ghRepo, ghPat))
@@ -1895,19 +1903,21 @@ function handleDashboard(request, env) {
         if (job.runId) {
           matchedRun = runs.find(r => r.id === job.runId);
         } else {
-          // Match by title or URL or temporal proximity
+          const norm = (s) => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+          const normTitle = norm(job.title);
+          const normUrl = norm(job.url);
+
           matchedRun = runs.find(r => {
-            const disp = (r.display_title || '').toLowerCase();
-            const jobTitle = (job.title || '').toLowerCase();
-            const jobUrl = (job.url || '').toLowerCase();
-            return (jobTitle && disp.includes(jobTitle)) || (jobUrl && disp.includes(jobUrl));
+            const normDisp = norm(r.display_title || r.name);
+            return (normTitle && (normDisp.includes(normTitle) || normTitle.includes(normDisp))) ||
+                   (normUrl && normDisp.includes(normUrl));
           });
 
           if (!matchedRun && runs.length > 0) {
-            // Find active run created after job started
+            // Find run created around or after job started
             const candidate = runs.find(r => {
               const runTime = new Date(r.created_at).getTime();
-              return runTime >= (job.startedAt - 45000);
+              return runTime >= (job.startedAt - 90000);
             });
             if (candidate && !activeJobs.some(j => j.runId === candidate.id)) {
               matchedRun = candidate;
