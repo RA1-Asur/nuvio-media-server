@@ -169,6 +169,64 @@ async function fetchCatalog(env, forceRefresh = false) {
   if (env.VAULT_KV) {
     try {
       cached = await env.VAULT_KV.get('catalog', 'json');
+
+      // Also check individual item keys to guarantee zero-latency discovery of items
+      // added during concurrent bulk ingestion runs
+      const itemKeys = await env.VAULT_KV.list({ prefix: 'item:' });
+      if (itemKeys && Array.isArray(itemKeys.keys) && itemKeys.keys.length > 0) {
+        const cachedFilenames = new Set(
+          cached && Array.isArray(cached.items) ? cached.items.map((i) => i.filename) : []
+        );
+        const itemsMap = new Map();
+        if (cached && Array.isArray(cached.items)) {
+          for (const it of cached.items) {
+            if (it && it.filename) itemsMap.set(it.filename, it);
+          }
+        }
+
+        let hasMissingItems = false;
+        for (const k of itemKeys.keys) {
+          const fname = k.name.replace(/^item:/, '');
+          if (!cachedFilenames.has(fname)) {
+            hasMissingItems = true;
+            if (k.metadata && k.metadata.filename) {
+              itemsMap.set(k.metadata.filename, {
+                id: k.metadata.id,
+                imdb_id: null,
+                title: k.metadata.title,
+                filename: k.metadata.filename,
+                direct_stream_url: k.metadata.direct_stream_url,
+                poster: k.metadata.poster,
+                description: `Uploaded to ${env.IA_ITEM_ID || 'nuvio-cloud-vault-2026'}`,
+                duration: 0,
+                duration_str: k.metadata.duration_str || 'Unknown',
+                size_bytes: Math.round((k.metadata.size_mb || 0) * 1024 * 1024),
+                size_mb: k.metadata.size_mb || 0,
+                resolution: k.metadata.resolution || 'HD',
+                added_at: k.metadata.added_at || new Date().toISOString(),
+              });
+            } else {
+              const fullItem = await env.VAULT_KV.get(k.name, 'json');
+              if (fullItem && fullItem.filename) {
+                itemsMap.set(fullItem.filename, fullItem);
+              }
+            }
+          }
+        }
+
+        if (hasMissingItems) {
+          const mergedList = Array.from(itemsMap.values());
+          mergedList.sort((a, b) => new Date(b.added_at || 0) - new Date(a.added_at || 0));
+          cached = {
+            version: 1,
+            item_id: env.IA_ITEM_ID || 'nuvio-cloud-vault-2026',
+            updated_at: new Date().toISOString(),
+            items: mergedList,
+          };
+          await env.VAULT_KV.put('catalog', JSON.stringify(cached));
+        }
+      }
+
       if (!forceRefresh && cached && Array.isArray(cached.items) && cached.items.length > 0) {
         return cached;
       }
@@ -784,6 +842,7 @@ async function handleDelete(request, env) {
   // 1. Instantly update Cloudflare KV so Nuvio and Dashboard reflect deletion with 0ms lag
   if (env.VAULT_KV) {
     try {
+      await env.VAULT_KV.delete(`item:${targetFilename}`);
       await env.VAULT_KV.put('catalog', JSON.stringify(newCatalog));
     } catch (e) {
       console.warn('Failed to update KV after delete:', e.message);
@@ -844,7 +903,10 @@ async function handleDelete(request, env) {
 }
 
 /**
- * Handle Catalog Append: Appends newly ingested video to Cloudflare KV
+ * Handle Catalog Append: Appends newly ingested video to Cloudflare KV.
+ * Writes each item under its own distinct 'item:<filename>' key to guarantee
+ * zero-contention atomic safety during concurrent bulk ingestion runs, then
+ * merges into the master catalog.
  */
 async function handleCatalogAppend(request, env) {
   let body;
@@ -854,9 +916,10 @@ async function handleCatalogAppend(request, env) {
     return jsonResponse({ success: false, error: 'Invalid JSON body' }, 400);
   }
 
-  const { entry, admin_pin } = body;
-  if (!entry || !entry.id) {
-    return jsonResponse({ success: false, error: 'Valid entry is required' }, 400);
+  const { entry, entries, admin_pin } = body;
+  const itemsToAppend = Array.isArray(entries) ? entries : (entry ? [entry] : []);
+  if (itemsToAppend.length === 0 || !itemsToAppend[0].id) {
+    return jsonResponse({ success: false, error: 'Valid entry or entries array is required' }, 400);
   }
 
   const configuredPin = env.ADMIN_PIN;
@@ -864,31 +927,37 @@ async function handleCatalogAppend(request, env) {
     return jsonResponse({ success: false, error: 'Unauthorized: Invalid Admin PIN' }, 401);
   }
 
-  const catalog = await fetchCatalog(env);
-  const updatedItems = [
-    entry,
-    ...catalog.items.filter((i) => i.id !== entry.id && i.filename !== entry.filename),
-  ];
-
-  const newCatalog = {
-    version: 1,
-    item_id: env.IA_ITEM_ID || 'nuvio-cloud-vault-2026',
-    updated_at: new Date().toISOString(),
-    items: updatedItems,
-  };
-
+  // 1. Immediately store each item under its own individual KV key (atomic, race-condition free)
   if (env.VAULT_KV) {
-    try {
-      await env.VAULT_KV.put('catalog', JSON.stringify(newCatalog));
-    } catch (e) {
-      console.warn('Failed to update KV on append:', e.message);
+    for (const item of itemsToAppend) {
+      if (item && item.filename) {
+        try {
+          const meta = {
+            id: item.id,
+            title: item.title,
+            filename: item.filename,
+            direct_stream_url: item.direct_stream_url,
+            poster: item.poster,
+            size_mb: item.size_mb || 0,
+            resolution: item.resolution || 'HD',
+            duration_str: item.duration_str || 'Unknown',
+            added_at: item.added_at || new Date().toISOString(),
+          };
+          await env.VAULT_KV.put(`item:${item.filename}`, JSON.stringify(item), { metadata: meta });
+        } catch (e) {
+          console.warn(`Failed to put individual item ${item.filename} in KV:`, e.message);
+        }
+      }
     }
   }
+
+  // 2. Fetch fresh catalog and merge all items
+  const catalog = await fetchCatalog(env, true);
 
   return jsonResponse({
     success: true,
     message: 'Video appended to catalog successfully!',
-    count: updatedItems.length,
+    count: catalog.items.length,
   });
 }
 

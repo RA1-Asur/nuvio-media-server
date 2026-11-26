@@ -258,7 +258,7 @@ def sync_catalog_index(ia_item_id, access_key, secret_key, new_entry):
         files={ "catalog_index.json": local_catalog_path },
         access_key=access_key,
         secret_key=secret_key,
-        headers={"x-archive-no-derive": "1", "x-archive-keep-old-version": "0"},
+        headers={"x-archive-no-derive": "1", "x-archive-keep-old-version": "0", "x-archive-queue-derive": "0"},
         queue_derive=False,
         retries=5,
         verbose=True
@@ -268,19 +268,23 @@ def sync_catalog_index(ia_item_id, access_key, secret_key, new_entry):
     # 4. Notify Cloudflare Worker to update KV immediately
     admin_pin = os.environ.get("ADMIN_PIN") or "Aa@1268391680"
     if worker_url and admin_pin:
-        try:
-            print(f"[INFO] Notifying Cloudflare Worker KV ({worker_url}/api/catalog/append)...")
-            append_res = requests.post(
-                f"{worker_url}/api/catalog/append",
-                json={"entry": new_entry, "admin_pin": admin_pin},
-                timeout=10
-            )
-            if append_res.status_code == 200:
-                print("[SUCCESS] Cloudflare KV catalog updated instantly!")
-            else:
-                print(f"[WARNING] Worker KV notify returned HTTP {append_res.status_code}")
-        except Exception as e:
-            print(f"[WARNING] Could not notify Cloudflare Worker KV: {e}")
+        for attempt in range(1, 4):
+            try:
+                print(f"[INFO] Notifying Cloudflare Worker KV ({worker_url}/api/catalog/append, attempt {attempt}/3)...")
+                append_res = requests.post(
+                    f"{worker_url}/api/catalog/append",
+                    json={"entry": new_entry, "admin_pin": admin_pin},
+                    timeout=15
+                )
+                if append_res.status_code == 200:
+                    res_data = append_res.json()
+                    print(f"[SUCCESS] Cloudflare KV catalog updated instantly! Total items: {res_data.get('count')}")
+                    break
+                else:
+                    print(f"[WARNING] Worker KV notify returned HTTP {append_res.status_code}: {append_res.text}")
+            except Exception as e:
+                print(f"[WARNING] Could not notify Cloudflare Worker KV (attempt {attempt}): {e}")
+            time.sleep(1.5 * attempt)
 
 
 def main():
@@ -376,21 +380,26 @@ def main():
 
         # Step 4: Upload to Internet Archive with --no-derive
         print(f"\n--- Step 3: Uploading to Internet Archive item '{ia_item_id}' ---")
-        metadata = {
-            "mediatype": "movies",
-            "collection": "opensource_movies",
-            "title": f"Nuvio Cloud Vault - {ia_item_id}",
-            "description": "Zero-Cost Automated Video Vault powered by Internet Archive & Cloudflare Workers."
-        }
+        
+        # Only attach metadata if the item does not exist yet to avoid triggering derive jobs on existing items
+        target_item = ia.get_item(ia_item_id)
+        item_metadata = None
+        if not target_item.exists:
+            item_metadata = {
+                "mediatype": "movies",
+                "collection": "opensource_movies",
+                "title": f"Nuvio Cloud Vault - {ia_item_id}",
+                "description": "Zero-Cost Automated Video Vault powered by Internet Archive & Cloudflare Workers."
+            }
 
         print(f"[INFO] Uploading files: {list(files_to_upload.keys())}")
         ia.upload(
             ia_item_id,
             files=files_to_upload,
-            metadata=metadata,
+            metadata=item_metadata,
             access_key=ia_access_key,
             secret_key=ia_secret_key,
-            headers={"x-archive-no-derive": "1"},
+            headers={"x-archive-no-derive": "1", "x-archive-queue-derive": "0"},
             queue_derive=False,
             retries=5,
             verbose=True
