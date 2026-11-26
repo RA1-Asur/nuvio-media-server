@@ -1,4 +1,5 @@
 name: Ingest Video to Cloud Vault
+run-name: Ingest ${{ github.event.inputs.custom_title || github.event.client_payload.custom_title || github.event.inputs.video_url || github.event.client_payload.video_url || 'Video' }}
 
 on:
   workflow_dispatch:

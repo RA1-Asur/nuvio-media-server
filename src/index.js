@@ -527,7 +527,62 @@ async function handleStream(path, env) {
 }
 
 /**
- * Handle API Enqueue: Trigger GitHub Action repository_dispatch
+ * Helper to parse single or multiple video URLs from enqueue request
+ */
+function parseEnqueueItems(body) {
+  const items = [];
+
+  if (Array.isArray(body.urls) && body.urls.length > 0) {
+    for (const u of body.urls) {
+      if (typeof u === 'string' && u.trim()) {
+        items.push({
+          video_url: u.trim(),
+          custom_title: '',
+          imdb_id: '',
+          poster_url: '',
+        });
+      } else if (typeof u === 'object' && u && typeof u.video_url === 'string' && u.video_url.trim()) {
+        items.push({
+          video_url: u.video_url.trim(),
+          custom_title: (u.custom_title || '').trim(),
+          imdb_id: (u.imdb_id || '').trim(),
+          poster_url: (u.poster_url || '').trim(),
+        });
+      }
+    }
+  } else if (typeof body.video_url === 'string' || typeof body.video_urls === 'string') {
+    const raw = (body.video_url || body.video_urls || '').trim();
+    const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+
+    for (const line of lines) {
+      if (line.includes('|')) {
+        const parts = line.split('|');
+        const vUrl = parts[0].trim();
+        const vTitle = parts.slice(1).join('|').trim();
+        if (vUrl) {
+          items.push({
+            video_url: vUrl,
+            custom_title: vTitle,
+            imdb_id: (body.imdb_id || '').trim(),
+            poster_url: (body.poster_url || '').trim(),
+          });
+        }
+      } else {
+        items.push({
+          video_url: line,
+          custom_title: lines.length === 1 ? (body.custom_title || '').trim() : '',
+          imdb_id: lines.length === 1 ? (body.imdb_id || '').trim() : '',
+          poster_url: lines.length === 1 ? (body.poster_url || '').trim() : '',
+        });
+      }
+    }
+  }
+
+  return items;
+}
+
+/**
+ * Handle API Enqueue: Trigger GitHub Action repository_dispatch (supports single & bulk URLs)
  */
 async function handleEnqueue(request, env) {
   let body;
@@ -537,11 +592,7 @@ async function handleEnqueue(request, env) {
     return jsonResponse({ success: false, error: 'Invalid JSON body' }, 400);
   }
 
-  const { video_url, custom_title, imdb_id, poster_url, admin_pin } = body;
-
-  if (!video_url || typeof video_url !== 'string') {
-    return jsonResponse({ success: false, error: 'video_url is required' }, 400);
-  }
+  const { admin_pin } = body;
 
   // Security Check: Verify ADMIN_PIN
   const configuredPin = env.ADMIN_PIN;
@@ -557,6 +608,11 @@ async function handleEnqueue(request, env) {
 
   if (!admin_pin || String(admin_pin) !== String(configuredPin)) {
     return jsonResponse({ success: false, error: 'Unauthorized: Invalid Admin PIN' }, 401);
+  }
+
+  const items = parseEnqueueItems(body);
+  if (items.length === 0) {
+    return jsonResponse({ success: false, error: 'At least one valid video URL is required' }, 400);
   }
 
   // Verify GitHub configuration
@@ -577,45 +633,69 @@ async function handleEnqueue(request, env) {
 
   const dispatchUrl = `https://api.github.com/repos/${ghOwner}/${ghRepo}/dispatches`;
 
-  const payload = {
-    event_type: 'ingest_video',
-    client_payload: {
-      video_url: video_url.trim(),
-      custom_title: (custom_title || '').trim(),
-      imdb_id: (imdb_id || '').trim(),
-      poster_url: (poster_url || '').trim(),
-    },
-  };
-
   try {
-    const ghRes = await fetch(dispatchUrl, {
-      method: 'POST',
-      headers: {
-        'User-Agent': 'Nuvio-Worker-Ingest/1.0',
-        'Authorization': `Bearer ${ghPat}`,
-        'Accept': 'application/vnd.github.v3+json',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(payload),
-    });
+    const dispatchResults = await Promise.all(
+      items.map(async (item) => {
+        const payload = {
+          event_type: 'ingest_video',
+          client_payload: {
+            video_url: item.video_url,
+            custom_title: item.custom_title,
+            imdb_id: item.imdb_id,
+            poster_url: item.poster_url,
+          },
+        };
 
-    if (ghRes.status === 204) {
-      return jsonResponse({
-        success: true,
-        message: 'Video successfully enqueued! GitHub Actions workflow triggered.',
-        target_item: env.IA_ITEM_ID || 'nuvio-cloud-vault-2026',
-        repository: `${ghOwner}/${ghRepo}`,
-      });
+        const ghRes = await fetch(dispatchUrl, {
+          method: 'POST',
+          headers: {
+            'User-Agent': 'Nuvio-Worker-Ingest/1.0',
+            'Authorization': `Bearer ${ghPat}`,
+            'Accept': 'application/vnd.github.v3+json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(payload),
+        });
+
+        const ok = ghRes.status === 204 || ghRes.status === 200;
+        let err = null;
+        if (!ok) {
+          err = await ghRes.text();
+        }
+
+        return {
+          video_url: item.video_url,
+          custom_title: item.custom_title,
+          ok,
+          status: ghRes.status,
+          error: err,
+        };
+      })
+    );
+
+    const failed = dispatchResults.filter((r) => !r.ok);
+    if (failed.length > 0 && failed.length === items.length) {
+      return jsonResponse(
+        {
+          success: false,
+          error: `GitHub API error: Failed to dispatch ingestion jobs (${failed[0].status}): ${failed[0].error}`,
+        },
+        502
+      );
     }
 
-    const errText = await ghRes.text();
-    return jsonResponse(
-      {
-        success: false,
-        error: `GitHub API error (${ghRes.status}): ${errText}`,
-      },
-      ghRes.status
-    );
+    return jsonResponse({
+      success: true,
+      count: items.length,
+      dispatched_count: items.length - failed.length,
+      message:
+        items.length === 1
+          ? 'Ingestion job dispatched to GitHub Actions successfully!'
+          : `All ${items.length} ingestion jobs dispatched to GitHub Actions successfully!`,
+      jobs: items.map((i) => ({ video_url: i.video_url, custom_title: i.custom_title })),
+      target_item: env.IA_ITEM_ID || 'nuvio-cloud-vault-2026',
+      repository: `${ghOwner}/${ghRepo}`,
+    });
   } catch (err) {
     return jsonResponse(
       {
@@ -810,7 +890,118 @@ async function handleCatalogAppend(request, env) {
 }
 
 /**
- * Handle API Runs: Return recent GitHub Actions workflow runs
+ * Enrich workflow run with real-time job step execution details & progress percentage
+ */
+async function enrichRunDetails(run, ghOwner, ghRepo, ghPat) {
+  const base = {
+    id: run.id,
+    name: run.name,
+    display_title: run.display_title || run.name,
+    status: run.status,
+    conclusion: run.conclusion,
+    html_url: run.html_url,
+    created_at: run.created_at,
+    updated_at: run.updated_at,
+    run_number: run.run_number,
+    current_step: '',
+    progress_pct: 0,
+  };
+
+  if (run.status === 'completed') {
+    base.progress_pct = 100;
+    if (run.conclusion === 'success') {
+      base.current_step = '✅ Video ingested and catalog updated!';
+    } else if (run.conclusion === 'cancelled') {
+      base.current_step = '⚠️ Run was cancelled';
+    } else {
+      base.current_step = '❌ Ingestion failed in runner (check logs)';
+    }
+    return base;
+  }
+
+  // If status is 'queued', runner has not started execution yet
+  if (run.status === 'queued') {
+    base.current_step = '⏳ Queued in GitHub Actions, waiting for available runner...';
+    base.progress_pct = 12;
+    return base;
+  }
+
+  // If status is 'in_progress', query runner jobs to find exact executing step
+  try {
+    const jobsRes = await fetch(
+      `https://api.github.com/repos/${ghOwner}/${ghRepo}/actions/runs/${run.id}/jobs`,
+      {
+        headers: {
+          'Authorization': `Bearer ${ghPat}`,
+          'Accept': 'application/vnd.github.v3+json',
+          'User-Agent': 'Nuvio-Cloudflare-Worker/1.0',
+        },
+      }
+    );
+
+    if (!jobsRes.ok) {
+      base.current_step = '⚡ Processing in GitHub runner...';
+      base.progress_pct = 50;
+      return base;
+    }
+
+    const jobsData = await jobsRes.json();
+    const job = (jobsData.jobs || [])[0];
+
+    if (!job) {
+      base.current_step = '⏳ Waiting for runner assignment...';
+      base.progress_pct = 15;
+      return base;
+    }
+
+    if (job.status === 'queued') {
+      base.current_step = '⏳ Assigned to runner, boot in progress...';
+      base.progress_pct = 15;
+      return base;
+    }
+
+    const steps = job.steps || [];
+    const inProgressStep = steps.find((s) => s.status === 'in_progress');
+    const stepName = inProgressStep
+      ? inProgressStep.name
+      : (steps.filter((s) => s.status === 'completed').pop()?.name || 'Initializing runner');
+
+    if (stepName.includes('Set up job') || stepName.includes('Initializing runner')) {
+      base.current_step = '⚙️ Initializing GitHub runner environment...';
+      base.progress_pct = 18;
+    } else if (stepName.includes('Checkout Repository')) {
+      base.current_step = '📥 Checking out repository code...';
+      base.progress_pct = 28;
+    } else if (stepName.includes('Set up Python')) {
+      base.current_step = '🐍 Configuring Python 3.11 environment...';
+      base.progress_pct = 38;
+    } else if (stepName.includes('Install System Dependencies')) {
+      base.current_step = '📦 Installing aria2 16-connection accelerator & ffmpeg...';
+      base.progress_pct = 52;
+    } else if (stepName.includes('Install Python Dependencies')) {
+      base.current_step = '📦 Installing yt-dlp & internetarchive tools...';
+      base.progress_pct = 68;
+    } else if (stepName.includes('Run Video Ingestion Engine')) {
+      base.current_step = '⚡ Downloading video & uploading directly to Archive.org vault...';
+      base.progress_pct = 86;
+    } else if (stepName.includes('Complete job')) {
+      base.current_step = '🎉 Finalizing catalog registration...';
+      base.progress_pct = 96;
+    } else {
+      base.current_step = `⚙️ ${stepName}...`;
+      base.progress_pct = inProgressStep ? 72 : 82;
+    }
+
+    return base;
+  } catch (e) {
+    base.current_step = '⚡ Processing in GitHub runner...';
+    base.progress_pct = 50;
+    return base;
+  }
+}
+
+/**
+ * Handle API Runs: Return recent GitHub Actions workflow runs with real-time steps
  */
 async function handleGetRuns(env) {
   const ghOwner = env.GH_OWNER;
@@ -823,7 +1014,7 @@ async function handleGetRuns(env) {
 
   try {
     const res = await fetch(
-      `https://api.github.com/repos/${ghOwner}/${ghRepo}/actions/runs?per_page=6`,
+      `https://api.github.com/repos/${ghOwner}/${ghRepo}/actions/runs?per_page=10`,
       {
         headers: {
           'Authorization': `Bearer ${ghPat}`,
@@ -838,18 +1029,13 @@ async function handleGetRuns(env) {
     }
 
     const data = await res.json();
-    const runs = (data.workflow_runs || [])
+    const runsList = (data.workflow_runs || [])
       .filter((r) => r.name === 'Ingest Video to Cloud Vault')
-      .map((r) => ({
-        id: r.id,
-        name: r.name,
-        status: r.status,
-        conclusion: r.conclusion,
-        html_url: r.html_url,
-        created_at: r.created_at,
-        updated_at: r.updated_at,
-        run_number: r.run_number,
-      }));
+      .slice(0, 8);
+
+    const runs = await Promise.all(
+      runsList.map((r) => enrichRunDetails(r, ghOwner, ghRepo, ghPat))
+    );
 
     return jsonResponse({ runs });
   } catch (err) {
@@ -1089,7 +1275,7 @@ function handleDashboard(request, env) {
       color: #cbd5e1;
     }
 
-    input[type="text"], input[type="url"], input[type="password"] {
+    input[type="text"], input[type="url"], input[type="password"], textarea {
       background: rgba(10, 12, 20, 0.85);
       border: 1px solid var(--card-border);
       border-radius: 8px;
@@ -1101,9 +1287,55 @@ function handleDashboard(request, env) {
       transition: border-color 0.2s;
     }
 
-    input:focus {
+    textarea {
+      resize: vertical;
+      min-height: 80px;
+      line-height: 1.4;
+    }
+
+    input:focus, textarea:focus {
       border-color: var(--primary);
       box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
+    }
+
+    .progress-bar-container {
+      width: 100%;
+      height: 7px;
+      background: rgba(255, 255, 255, 0.08);
+      border-radius: 4px;
+      overflow: hidden;
+      margin-top: 8px;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #6366f1, #a855f7);
+      border-radius: 4px;
+      transition: width 0.35s ease;
+    }
+    .progress-bar-fill.complete {
+      background: linear-gradient(90deg, #10b981, #059669);
+    }
+    .progress-bar-fill.failed {
+      background: linear-gradient(90deg, #ef4444, #dc2626);
+    }
+    .job-item {
+      background: rgba(10, 12, 20, 0.7);
+      border: 1px solid rgba(99, 102, 241, 0.25);
+      border-radius: 10px;
+      padding: 14px;
+      margin-bottom: 12px;
+      transition: all 0.2s ease;
+    }
+    .job-item:last-child {
+      margin-bottom: 0;
+    }
+    .job-item.completed {
+      border-color: rgba(16, 185, 129, 0.3);
+      background: rgba(16, 185, 129, 0.04);
+    }
+    .job-item.failed {
+      border-color: rgba(239, 68, 68, 0.3);
+      background: rgba(239, 68, 68, 0.04);
     }
 
     .pin-row {
@@ -1326,17 +1558,21 @@ function handleDashboard(request, env) {
       <form id="enqueueForm" onsubmit="handleEnqueueSubmit(event)">
         <div class="form-grid">
           <div class="form-group full-width">
-            <label for="videoUrl">Video Source URL *</label>
-            <input type="url" id="videoUrl" name="video_url" required placeholder="https://www.youtube.com/watch?v=... or direct MP4/MKV link">
+            <label for="videoUrls">Video Source URL(s) *</label>
+            <textarea id="videoUrls" name="video_urls" required rows="3" placeholder="Paste one or multiple video URLs (one per line):&#10;https://example.com/video1.mp4&#10;https://example.com/video2.mp4 | Custom Title 2&#10;https://www.youtube.com/watch?v=..."></textarea>
+            <div style="font-size: 0.78rem; color: var(--text-muted); margin-top: 4px; display: flex; gap: 6px; align-items: center;">
+              <span>💡</span>
+              <span><strong>Bulk Upload Supported:</strong> Paste 1 or multiple URLs (one per line). Format as <code>URL</code> or <code>URL | Custom Title</code>.</span>
+            </div>
           </div>
 
           <div class="form-group">
-            <label for="customTitle">Custom Title (Optional)</label>
+            <label for="customTitle">Custom Title (Optional for single URL)</label>
             <input type="text" id="customTitle" name="custom_title" placeholder="Override video title">
           </div>
 
           <div class="form-group">
-            <label for="imdbId">IMDb ID (Optional)</label>
+            <label for="imdbId">IMDb ID (Optional for single URL)</label>
             <input type="text" id="imdbId" name="imdb_id" placeholder="e.g. tt0111161">
           </div>
 
@@ -1366,11 +1602,16 @@ function handleDashboard(request, env) {
       </form>
     </div>
 
-    <!-- SECTION 2.5: LIVE INGESTION ACTIVITY -->
+    <!-- SECTION 2.5: LIVE INGESTION ACTIVITY & PROGRESS -->
     <div class="card" id="activityCard" style="display: none;">
-      <div class="card-title" style="margin-bottom: 12px;">
-        <span>⚡</span>
-        <span>Ingestion Activity & Progress</span>
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+        <div class="card-title" style="margin-bottom: 0;">
+          <span>⚡</span>
+          <span>Ingestion Activity & Live Progress</span>
+        </div>
+        <button id="clearFinishedBtn" class="btn btn-secondary btn-sm" onclick="clearFinishedJobs()" style="display: none; width: auto; padding: 4px 10px; font-size: 0.75rem;">
+          ✕ Clear Finished
+        </button>
       </div>
       <div id="activityContent"></div>
     </div>
@@ -1399,13 +1640,44 @@ function handleDashboard(request, env) {
 
   <script>
     let pollTimer = null;
+    let activeJobs = [];
+
+    // Load active jobs from localStorage
+    function loadActiveJobsFromStorage() {
+      try {
+        const stored = localStorage.getItem('nuvio_active_jobs');
+        if (stored) {
+          const parsed = JSON.parse(stored);
+          const now = Date.now();
+          activeJobs = parsed.filter(j => (now - (j.startedAt || 0)) < 2 * 3600 * 1000);
+          saveActiveJobsToStorage();
+        }
+      } catch (_) {
+        activeJobs = [];
+      }
+    }
+
+    function saveActiveJobsToStorage() {
+      try {
+        localStorage.setItem('nuvio_active_jobs', JSON.stringify(activeJobs));
+      } catch (_) {}
+    }
+
+    function clearFinishedJobs() {
+      activeJobs = activeJobs.filter(j => j.status !== 'completed' && j.status !== 'failed');
+      saveActiveJobsToStorage();
+      renderActivityCard();
+      checkActivity();
+    }
 
     document.addEventListener('DOMContentLoaded', () => {
       const savedPin = localStorage.getItem('nuvio_admin_pin');
       if (savedPin) {
         document.getElementById('adminPin').value = savedPin;
       }
+      loadActiveJobsFromStorage();
       loadCatalog();
+      renderActivityCard();
       checkActivity();
     });
 
@@ -1416,62 +1688,14 @@ function handleDashboard(request, env) {
       });
     }
 
-    async function checkActivity() {
-      try {
-        const res = await fetch('/api/runs?_t=' + Date.now());
-        const data = await res.json();
-        const runs = data.runs || [];
-        const card = document.getElementById('activityCard');
-        const content = document.getElementById('activityContent');
-
-        if (runs.length === 0) {
-          card.style.display = 'none';
-          return;
-        }
-
-        card.style.display = 'block';
-        const activeRun = runs.find(r => r.status === 'in_progress' || r.status === 'queued');
-
-        if (activeRun) {
-          const runNum = activeRun.run_number ? ('#' + activeRun.run_number) : '';
-          content.innerHTML = \`
-            <div style="background: rgba(99, 102, 241, 0.1); border: 1px solid rgba(99, 102, 241, 0.3); border-radius: 10px; padding: 14px;">
-              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                <span class="badge badge-progress">⏳ Ingestion in Progress \${runNum}</span>
-                <a href="\${activeRun.html_url}" target="_blank" class="btn btn-secondary btn-sm" style="padding: 4px 10px; font-size: 0.75rem;">🔗 Console Logs</a>
-              </div>
-              <div style="font-size: 0.88rem; color: var(--text-muted);">
-                Downloading video, extracting poster thumbnail, and uploading to Internet Archive vault...
-              </div>
-              <div class="pulse-bar"><div class="pulse-bar-fill"></div></div>
-            </div>
-          \`;
-
-          if (!pollTimer) {
-            pollTimer = setTimeout(async () => {
-              pollTimer = null;
-              await checkActivity();
-              await loadCatalog();
-            }, 4000);
-          }
-        } else {
-          const latest = runs[0];
-          const isSuccess = latest.conclusion === 'success';
-          const badgeClass = isSuccess ? 'badge-success' : 'badge-failed';
-          const badgeIcon = isSuccess ? '✅ Ingest Complete' : '❌ Ingest Failed';
-          const timeAgo = formatTimeAgo(latest.created_at);
-
-          content.innerHTML = \`
-            <div style="display: flex; justify-content: space-between; align-items: center; padding: 10px 0;">
-              <div>
-                <span class="badge \${badgeClass}">\${badgeIcon}</span>
-                <span style="font-size: 0.82rem; color: var(--text-muted); margin-left: 8px;">Run #\${latest.run_number} (\${timeAgo})</span>
-              </div>
-              <a href="\${latest.html_url}" target="_blank" class="btn btn-secondary btn-sm" style="padding: 4px 10px; font-size: 0.75rem;">Console Log</a>
-            </div>
-          \`;
-        }
-      } catch (_) {}
+    function escapeHtml(str) {
+      if (!str) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
     }
 
     function formatTimeAgo(isoStr) {
@@ -1483,6 +1707,250 @@ function handleDashboard(request, env) {
       if (mins < 60) return mins + ' mins ago';
       const hours = Math.floor(mins / 60);
       return hours + 'h ago';
+    }
+
+    function extractNameFromUrl(url) {
+      try {
+        const u = new URL(url);
+        const parts = u.pathname.split('/').filter(Boolean);
+        if (parts.length > 0) {
+          return decodeURIComponent(parts[parts.length - 1]);
+        }
+        return u.hostname;
+      } catch (_) {
+        return url.substring(0, 35) + '...';
+      }
+    }
+
+    // Render the activity card based on activeJobs & remote runs
+    function renderActivityCard(remoteRuns = []) {
+      const card = document.getElementById('activityCard');
+      const content = document.getElementById('activityContent');
+      const clearBtn = document.getElementById('clearFinishedBtn');
+
+      // Check if there are active client jobs
+      const hasClientJobs = activeJobs && activeJobs.length > 0;
+      const hasFinishedClientJobs = hasClientJobs && activeJobs.some(j => j.status === 'completed' || j.status === 'failed');
+
+      if (clearBtn) {
+        clearBtn.style.display = hasFinishedClientJobs ? 'inline-flex' : 'none';
+      }
+
+      if (hasClientJobs) {
+        card.style.display = 'block';
+        content.innerHTML = activeJobs.map(job => {
+          let badgeClass = 'badge-progress';
+          let badgeText = '⏳ Dispatching...';
+          let fillClass = '';
+
+          if (job.status === 'dispatching') {
+            badgeText = '🚀 Dispatching...';
+            badgeClass = 'badge-progress';
+          } else if (job.status === 'queued') {
+            badgeText = job.runNumber ? ('⏳ Queued #' + job.runNumber) : '⏳ Waiting for Runner...';
+            badgeClass = 'badge-progress';
+          } else if (job.status === 'in_progress') {
+            badgeText = '⚡ Ingesting ' + (job.runNumber ? ('#' + job.runNumber) : '') + ' (' + job.progress + '%)';
+            badgeClass = 'badge-progress';
+          } else if (job.status === 'completed') {
+            badgeText = '✅ Complete ' + (job.runNumber ? ('#' + job.runNumber) : '');
+            badgeClass = 'badge-success';
+            fillClass = 'complete';
+          } else if (job.status === 'failed') {
+            badgeText = '❌ Failed ' + (job.runNumber ? ('#' + job.runNumber) : '');
+            badgeClass = 'badge-failed';
+            fillClass = 'failed';
+          }
+
+          const consoleLink = job.htmlUrl ? 
+            \`<a href="\${escapeHtml(job.htmlUrl)}" target="_blank" class="btn btn-secondary btn-sm" style="padding: 3px 9px; font-size: 0.73rem; width: auto;">🔗 Console Log</a>\` : '';
+
+          const itemClass = (job.status === 'completed') ? 'job-item completed' : ((job.status === 'failed') ? 'job-item failed' : 'job-item');
+
+          return \`
+            <div class="\${itemClass}">
+              <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 6px;">
+                <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                  <span class="badge \${badgeClass}">\${badgeText}</span>
+                  <strong style="font-size: 0.92rem; color: #f1f5f9;">\${escapeHtml(job.title)}</strong>
+                </div>
+                \${consoleLink}
+              </div>
+              <div style="font-size: 0.78rem; color: var(--text-muted); word-break: break-all; margin-bottom: 6px;">
+                🔗 \${escapeHtml(job.url)}
+              </div>
+              <div style="display: flex; justify-content: space-between; font-size: 0.82rem; color: #cbd5e1; margin-top: 6px;">
+                <span>\${escapeHtml(job.step || 'Processing...')}</span>
+                <span style="font-weight: 700; color: #a5b4fc;">\${job.progress}%</span>
+              </div>
+              <div class="progress-bar-container">
+                <div class="progress-bar-fill \${fillClass}" style="width: \${job.progress}%;"></div>
+              </div>
+            </div>
+          \`;
+        }).join('');
+        return;
+      }
+
+      // If no client jobs stored locally, check remote runs from GitHub
+      if (remoteRuns.length === 0) {
+        card.style.display = 'none';
+        return;
+      }
+
+      card.style.display = 'block';
+      const activeRuns = remoteRuns.filter(r => r.status === 'in_progress' || r.status === 'queued');
+
+      if (activeRuns.length > 0) {
+        content.innerHTML = activeRuns.map(run => {
+          const runNum = run.run_number ? ('#' + run.run_number) : '';
+          const displayTitle = run.display_title || run.name || 'Video Ingestion';
+          const pct = run.progress_pct || (run.status === 'queued' ? 12 : 50);
+          const step = run.current_step || (run.status === 'queued' ? 'Queued in GitHub Actions...' : '⚡ Processing in GitHub runner...');
+          
+          return \`
+            <div class="job-item">
+              <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 6px;">
+                <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                  <span class="badge badge-progress">⚡ Ingesting \${runNum} (\${pct}%)</span>
+                  <strong style="font-size: 0.92rem; color: #f1f5f9;">\${escapeHtml(displayTitle)}</strong>
+                </div>
+                <a href="\${escapeHtml(run.html_url)}" target="_blank" class="btn btn-secondary btn-sm" style="padding: 3px 9px; font-size: 0.73rem; width: auto;">🔗 Console Log</a>
+              </div>
+              <div style="display: flex; justify-content: space-between; font-size: 0.82rem; color: #cbd5e1; margin-top: 6px;">
+                <span>\${escapeHtml(step)}</span>
+                <span style="font-weight: 700; color: #a5b4fc;">\${pct}%</span>
+              </div>
+              <div class="progress-bar-container">
+                <div class="progress-bar-fill" style="width: \${pct}%;"></div>
+              </div>
+            </div>
+          \`;
+        }).join('');
+      } else {
+        const latest = remoteRuns[0];
+        const isSuccess = latest.conclusion === 'success';
+        const badgeClass = isSuccess ? 'badge-success' : 'badge-failed';
+        const badgeIcon = isSuccess ? '✅ Ingest Complete' : '❌ Ingest Failed';
+        const timeAgo = formatTimeAgo(latest.created_at);
+
+        content.innerHTML = \`
+          <div style="display: flex; justify-content: space-between; align-items: center; padding: 6px 0;">
+            <div>
+              <span class="badge \${badgeClass}">\${badgeIcon}</span>
+              <span style="font-size: 0.85rem; font-weight: 600; color: #f1f5f9; margin-left: 8px;">Run #\${latest.run_number}</span>
+              <span style="font-size: 0.8rem; color: var(--text-muted); margin-left: 6px;">(\${timeAgo})</span>
+              <div style="font-size: 0.8rem; color: #94a3b8; margin-top: 4px;">\${escapeHtml(latest.current_step || 'Vault catalog synchronized.')}</div>
+            </div>
+            <a href="\${escapeHtml(latest.html_url)}" target="_blank" class="btn btn-secondary btn-sm" style="padding: 4px 10px; font-size: 0.75rem; width: auto;">Console Log</a>
+          </div>
+        \`;
+      }
+    }
+
+    async function checkActivity() {
+      try {
+        const res = await fetch('/api/runs?_t=' + Date.now());
+        const data = await res.json();
+        const runs = data.runs || [];
+
+        // Sync runs with active client jobs
+        if (activeJobs.length > 0) {
+          syncRunsWithJobs(runs);
+        }
+
+        renderActivityCard(runs);
+
+        // Check if any jobs or runs are still active
+        const hasPendingJobs = activeJobs.some(j => j.status === 'dispatching' || j.status === 'queued' || j.status === 'in_progress');
+        const hasActiveRuns = runs.some(r => r.status === 'in_progress' || r.status === 'queued');
+
+        if (hasPendingJobs || hasActiveRuns) {
+          if (pollTimer) clearTimeout(pollTimer);
+          pollTimer = setTimeout(checkActivity, 2500);
+        } else {
+          if (pollTimer) {
+            clearTimeout(pollTimer);
+            pollTimer = null;
+          }
+        }
+      } catch (err) {
+        console.warn('Check activity error:', err);
+        if (activeJobs.some(j => j.status === 'dispatching' || j.status === 'queued' || j.status === 'in_progress')) {
+          if (pollTimer) clearTimeout(pollTimer);
+          pollTimer = setTimeout(checkActivity, 3500);
+        }
+      }
+    }
+
+    function syncRunsWithJobs(runs) {
+      let catalogNeedsReload = false;
+
+      // Group or match runs
+      for (const job of activeJobs) {
+        if (job.status === 'completed' || job.status === 'failed') continue;
+
+        // Try to find matching run
+        let matchedRun = null;
+        if (job.runId) {
+          matchedRun = runs.find(r => r.id === job.runId);
+        } else {
+          // Match by title or URL or temporal proximity
+          matchedRun = runs.find(r => {
+            const disp = (r.display_title || '').toLowerCase();
+            const jobTitle = (job.title || '').toLowerCase();
+            const jobUrl = (job.url || '').toLowerCase();
+            return (jobTitle && disp.includes(jobTitle)) || (jobUrl && disp.includes(jobUrl));
+          });
+
+          if (!matchedRun && runs.length > 0) {
+            // Find active run created after job started
+            const candidate = runs.find(r => {
+              const runTime = new Date(r.created_at).getTime();
+              return runTime >= (job.startedAt - 45000);
+            });
+            if (candidate && !activeJobs.some(j => j.runId === candidate.id)) {
+              matchedRun = candidate;
+            }
+          }
+        }
+
+        if (matchedRun) {
+          job.runId = matchedRun.id;
+          job.runNumber = matchedRun.run_number;
+          job.htmlUrl = matchedRun.html_url;
+
+          if (matchedRun.status === 'completed') {
+            job.status = matchedRun.conclusion === 'success' ? 'completed' : 'failed';
+            job.progress = 100;
+            job.step = matchedRun.current_step || (matchedRun.conclusion === 'success' ? '✅ Complete!' : '❌ Failed');
+            if (matchedRun.conclusion === 'success' && !job.catalogRefreshed) {
+              job.catalogRefreshed = true;
+              catalogNeedsReload = true;
+            }
+          } else {
+            job.status = matchedRun.status; // 'in_progress' or 'queued'
+            job.progress = Math.max(job.progress || 20, matchedRun.progress_pct || 25);
+            job.step = matchedRun.current_step || '⚡ Executing in GitHub runner...';
+          }
+        } else {
+          // Still waiting for GitHub to instantiate the run (takes 3-10s)
+          const elapsed = Date.now() - job.startedAt;
+          if (elapsed > 10000 && job.progress < 22) {
+            job.progress = 22;
+            job.step = '⏳ Provisioning GitHub runner environment...';
+          } else if (elapsed > 4000 && job.progress < 18) {
+            job.progress = 18;
+            job.step = '⏳ Dispatched! Waiting for GitHub runner to initialize...';
+          }
+        }
+      }
+
+      saveActiveJobsToStorage();
+
+      if (catalogNeedsReload) {
+        loadCatalog(true);
+      }
     }
 
     async function handleEnqueueSubmit(e) {
@@ -1498,43 +1966,125 @@ function handleDashboard(request, env) {
         localStorage.removeItem('nuvio_admin_pin');
       }
 
-      btn.disabled = true;
-      btn.innerHTML = '⏳ Dispatching to GitHub Actions...';
-      alertBox.className = 'alert';
-      alertBox.style.display = 'none';
+      const rawUrls = document.getElementById('videoUrls').value.trim();
+      const customTitleInput = document.getElementById('customTitle').value.trim();
+      const imdbIdInput = document.getElementById('imdbId').value.trim();
+      const posterUrlInput = document.getElementById('posterUrl').value.trim();
 
-      const payload = {
-        video_url: document.getElementById('videoUrl').value,
-        custom_title: document.getElementById('customTitle').value,
-        imdb_id: document.getElementById('imdbId').value,
-        poster_url: document.getElementById('posterUrl').value,
-        admin_pin: pin
-      };
+      const lines = rawUrls.split(String.fromCharCode(10)).map(l => l.trim()).filter(Boolean);
+      if (lines.length === 0) {
+        alertBox.className = 'alert error';
+        alertBox.style.display = 'flex';
+        alertBox.innerHTML = '❌ Please enter at least one valid video URL.';
+        return;
+      }
+
+      // Parse items
+      const itemsToEnqueue = [];
+      for (const line of lines) {
+        if (line.includes('|')) {
+          const parts = line.split('|');
+          itemsToEnqueue.push({
+            video_url: parts[0].trim(),
+            custom_title: parts.slice(1).join('|').trim(),
+            imdb_id: imdbIdInput,
+            poster_url: posterUrlInput,
+          });
+        } else {
+          itemsToEnqueue.push({
+            video_url: line,
+            custom_title: lines.length === 1 ? customTitleInput : '',
+            imdb_id: lines.length === 1 ? imdbIdInput : '',
+            poster_url: lines.length === 1 ? posterUrlInput : '',
+          });
+        }
+      }
+
+      // 0-MILLISECOND INSTANT UI UPDATE: Create client jobs and render immediately
+      const now = Date.now();
+      const newJobs = itemsToEnqueue.map((item, idx) => ({
+        id: 'job_' + now + '_' + idx + '_' + Math.random().toString(36).substr(2, 4),
+        url: item.video_url,
+        title: item.custom_title || extractNameFromUrl(item.video_url),
+        status: 'dispatching',
+        step: '🚀 Dispatching job to GitHub Actions...',
+        progress: 10,
+        startedAt: now,
+        runId: null,
+        runNumber: null,
+        htmlUrl: null,
+        catalogRefreshed: false,
+      }));
+
+      activeJobs = [...newJobs, ...activeJobs];
+      saveActiveJobsToStorage();
+
+      // Show activity card instantly
+      renderActivityCard();
+
+      // Update button state
+      btn.disabled = true;
+      btn.innerHTML = '⏳ Dispatching ' + itemsToEnqueue.length + ' video' + (itemsToEnqueue.length === 1 ? '' : 's') + '...';
+
+      // Clear input form
+      document.getElementById('videoUrls').value = '';
+      document.getElementById('customTitle').value = '';
+      document.getElementById('imdbId').value = '';
+      document.getElementById('posterUrl').value = '';
+
+      alertBox.className = 'alert success';
+      alertBox.style.display = 'flex';
+      alertBox.innerHTML = '✅ <strong>Ingestion Triggered!</strong> ' + 
+        (itemsToEnqueue.length === 1 ? 'Video job dispatched' : itemsToEnqueue.length + ' video jobs dispatched') + 
+        '. Track live runner progress below.';
 
       try {
         const res = await fetch('/api/enqueue', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
+          body: JSON.stringify({
+            urls: itemsToEnqueue,
+            admin_pin: pin
+          })
         });
 
         const data = await res.json();
 
         if (res.ok && data.success) {
-          alertBox.className = 'alert success';
-          alertBox.style.display = 'flex';
-          alertBox.innerHTML = '✅ <strong>Ingestion Triggered!</strong> ' + data.message + ' Track live progress below.';
-          document.getElementById('videoUrl').value = '';
-          document.getElementById('customTitle').value = '';
-          document.getElementById('imdbId').value = '';
-          document.getElementById('posterUrl').value = '';
-          setTimeout(checkActivity, 1500);
+          // Update newly added jobs
+          for (const j of newJobs) {
+            j.status = 'queued';
+            j.step = '⚡ Dispatched! GitHub Actions runner is spinning up...';
+            j.progress = 20;
+          }
+          saveActiveJobsToStorage();
+          renderActivityCard();
+
+          // Start aggressive polling loop
+          if (pollTimer) clearTimeout(pollTimer);
+          pollTimer = setTimeout(checkActivity, 1500);
         } else {
+          for (const j of newJobs) {
+            j.status = 'failed';
+            j.step = '❌ ' + (data.error || 'Failed to dispatch');
+            j.progress = 100;
+          }
+          saveActiveJobsToStorage();
+          renderActivityCard();
+
           alertBox.className = 'alert error';
           alertBox.style.display = 'flex';
           alertBox.innerHTML = '❌ <strong>Error:</strong> ' + (data.error || 'Failed to trigger ingestion');
         }
       } catch (err) {
+        for (const j of newJobs) {
+          j.status = 'failed';
+          j.step = '❌ Network Error: ' + err.message;
+          j.progress = 100;
+        }
+        saveActiveJobsToStorage();
+        renderActivityCard();
+
         alertBox.className = 'alert error';
         alertBox.style.display = 'flex';
         alertBox.innerHTML = '❌ <strong>Network Error:</strong> ' + err.message;
