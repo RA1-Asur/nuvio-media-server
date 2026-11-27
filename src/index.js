@@ -50,19 +50,22 @@ const MANIFEST = {
   },
 };
 
+const DEFAULT_POSTER =
+  'data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%20640%20360%22%20width%3D%22100%25%22%20height%3D%22100%25%22%3E%3Cdefs%3E%3ClinearGradient%20id%3D%22g%22%20x1%3D%220%25%22%20y1%3D%220%25%22%20x2%3D%22100%25%22%20y2%3D%22100%25%22%3E%3Cstop%20offset%3D%220%25%22%20stop-color%3D%22%230f172a%22/%3E%3Cstop%20offset%3D%22100%25%22%20stop-color%3D%22%231e1b4b%22/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect%20width%3D%22100%25%22%20height%3D%22100%25%22%20fill%3D%22url(%23g)%22/%3E%3Ccircle%20cx%3D%22320%22%20cy%3D%22170%22%20r%3D%2240%22%20fill%3D%22%236366f1%22%20fill-opacity%3D%220.25%22/%3E%3Cpolygon%20points%3D%22312%2C154%20312%2C186%20338%2C170%22%20fill%3D%22%23818cf8%22/%3E%3Ctext%20x%3D%22320%22%20y%3D%22230%22%20fill%3D%22%2394a3b8%22%20font-family%3D%22system-ui%2C%20-apple-system%2C%20sans-serif%22%20font-size%3D%2214%22%20font-weight%3D%22600%22%20letter-spacing%3D%221%22%20text-anchor%3D%22middle%22%3ENUVIO%20VAULT%3C/text%3E%3C/svg%3E';
+
 /**
  * Helper to resolve high-quality poster URL:
- * 1. Stored poster
+ * 1. Stored poster (if not pointing to irrelevant collection thumbnail)
  * 2. Cinemeta official IMDb poster if IMDb ID present
- * 3. Internet Archive item banner fallback
+ * 3. Neutral dark cinema SVG fallback
  */
 function resolvePoster(item, itemId) {
-  if (item && item.poster) return item.poster;
+  if (item && item.poster && !item.poster.includes('archive.org/services/img')) return item.poster;
   const imdbId = item ? (item.imdb_id || (item.id && item.id.startsWith('tt') ? item.id : null)) : null;
   if (imdbId) {
     return `https://images.metahub.space/poster/medium/${imdbId}/img`;
   }
-  return `https://archive.org/services/img/${itemId || 'nuvio-cloud-vault-2026'}`;
+  return DEFAULT_POSTER;
 }
 
 /**
@@ -236,6 +239,7 @@ async function fetchCatalog(env, forceRefresh = false) {
   }
 
   const itemId = env.IA_ITEM_ID || 'nuvio-cloud-vault-2026';
+  const defaultPoster = DEFAULT_POSTER;
   const catalogUrl = `https://archive.org/download/${itemId}/catalog_index.json?_t=${Date.now()}`;
   const metadataUrl = `https://archive.org/metadata/${itemId}`;
 
@@ -271,6 +275,24 @@ async function fetchCatalog(env, forceRefresh = false) {
       try {
         const metaJson = await metaRes.value.json();
         if (Array.isArray(metaJson.files)) {
+          const validExts = ['.mp4', '.mkv', '.webm', '.avi', '.mov', '.m4v'];
+          const liveOriginalNames = new Set();
+          for (const f of metaJson.files) {
+            const n = (f.name || '').toLowerCase();
+            const isOrig = !f.source || f.source === 'original';
+            const isDeriv = n.endsWith('.ia.mp4') || n.includes('_512kb.mp4') || n.endsWith('.ogv');
+            if (isOrig && !isDeriv && validExts.some((ext) => n.endsWith(ext))) {
+              liveOriginalNames.add(f.name);
+            }
+          }
+
+          // Prune any deleted/ghost files from itemsMap that no longer exist in live Archive.org files
+          for (const fname of Array.from(itemsMap.keys())) {
+            if (!liveOriginalNames.has(fname)) {
+              itemsMap.delete(fname);
+            }
+          }
+
           const discovered = parseArchiveFiles(metaJson.files, itemId);
           for (const it of discovered.items) {
             if (it.filename && !itemsMap.has(it.filename)) {
@@ -281,7 +303,7 @@ async function fetchCatalog(env, forceRefresh = false) {
       } catch (_) {}
     }
 
-    // 3. Overlay any richer metadata from catalog_index.json
+    // 3. Overlay any richer metadata from catalog_index.json (only for items that actually exist)
     if (catRes.status === 'fulfilled' && catRes.value.ok) {
       try {
         const data = await catRes.value.json();
@@ -291,12 +313,23 @@ async function fetchCatalog(env, forceRefresh = false) {
           ? data.items
           : [];
         for (const it of rawItems) {
-          if (it.filename) {
+          if (it.filename && itemsMap.has(it.filename)) {
             const existing = itemsMap.get(it.filename) || {};
-            itemsMap.set(it.filename, { ...existing, ...it });
+            const poster = (it.poster && !it.poster.includes('archive.org/services/img')) ? it.poster : existing.poster;
+            itemsMap.set(it.filename, { ...existing, ...it, poster });
           }
         }
       } catch (_) {}
+    }
+
+    // Ensure no derivative or ghost items remain and no services/img fallback
+    for (const [fname, it] of itemsMap.entries()) {
+      const lower = fname.toLowerCase();
+      if (lower.endsWith('.ia.mp4') || lower.includes('_512kb.mp4') || lower.endsWith('.ogv')) {
+        itemsMap.delete(fname);
+      } else if (!it.poster || it.poster.includes('archive.org/services/img')) {
+        it.poster = DEFAULT_POSTER;
+      }
     }
 
     let finalItems = Array.from(itemsMap.values());
@@ -338,7 +371,15 @@ function parseArchiveFiles(files, itemId) {
   const items = files
     .filter((f) => {
       const name = (f.name || '').toLowerCase();
+      const isOriginal = !f.source || f.source === 'original';
+      const isDerivative =
+        name.endsWith('.ia.mp4') ||
+        name.includes('_512kb.mp4') ||
+        name.endsWith('.ogv') ||
+        name.includes('_thumb');
       return (
+        isOriginal &&
+        !isDerivative &&
         validExts.some((ext) => name.endsWith(ext)) &&
         !name.endsWith('_archive.torrent') &&
         !name.endsWith('_meta.xml')
@@ -356,7 +397,7 @@ function parseArchiveFiles(files, itemId) {
       const thumbName = `${fname}_thumb.jpg`;
       const poster = fileNameSet.has(thumbName)
         ? `https://archive.org/download/${itemId}/${encodeURIComponent(thumbName)}`
-        : `https://archive.org/services/img/${itemId}`;
+        : DEFAULT_POSTER;
 
       return {
         id: safeId,
@@ -458,6 +499,7 @@ async function handleCatalog(path, url, env) {
 
   // Format into Nuvio MetaPreview format with explicit landscape shape
   const itemId = env.IA_ITEM_ID || 'nuvio-cloud-vault-2026';
+  const defaultPoster = DEFAULT_POSTER;
   const metas = paginated.map((item) => ({
     id: item.id,
     type: item.type || 'movie',
@@ -483,6 +525,7 @@ async function handleMeta(path, env) {
   const requestedId = decodeURIComponent(match[1]);
   const catalog = await fetchCatalog(env);
   const itemId = env.IA_ITEM_ID || 'nuvio-cloud-vault-2026';
+  const defaultPoster = DEFAULT_POSTER;
 
   let item = catalog.items.find(
     (i) => i.id === requestedId || (i.imdb_id && i.imdb_id === requestedId)
@@ -501,7 +544,7 @@ async function handleMeta(path, env) {
           title: decodedFilename.replace(/\.[^/.]+$/, '').replace(/_+/g, ' ').trim(),
           filename: decodedFilename,
           direct_stream_url: `https://archive.org/download/${itemId}/${encodeURIComponent(decodedFilename)}`,
-          poster: `https://archive.org/services/img/${itemId}`,
+          poster: DEFAULT_POSTER,
           description: `Direct archive stream of ${decodedFilename}`,
         };
       }
@@ -540,6 +583,7 @@ async function handleStream(path, env) {
   const requestedId = decodeURIComponent(match[1]);
   const catalog = await fetchCatalog(env);
   const itemId = env.IA_ITEM_ID || 'nuvio-cloud-vault-2026';
+  const defaultPoster = DEFAULT_POSTER;
 
   let item = catalog.items.find(
     (i) => i.id === requestedId || (i.imdb_id && i.imdb_id === requestedId)
@@ -811,6 +855,7 @@ async function handleDelete(request, env) {
   }
 
   const itemId = env.IA_ITEM_ID || 'nuvio-cloud-vault-2026';
+  const defaultPoster = DEFAULT_POSTER;
   const accessKey = env.IA_ACCESS_KEY;
   const secretKey = env.IA_SECRET_KEY;
 
@@ -1130,6 +1175,7 @@ function handleDashboard(request, env) {
   const manifestUrl = `${protocol}//${host}/manifest.json`;
   const stremioDeepLink = `stremio://${host}/manifest.json`;
   const itemId = env.IA_ITEM_ID || 'nuvio-cloud-vault-2026';
+  const defaultPoster = DEFAULT_POSTER;
 
   const html = `<!DOCTYPE html>
 <html lang="en">
@@ -1591,6 +1637,133 @@ function handleDashboard(request, env) {
       .catalog-grid { grid-template-columns: 1fr; }
       .video-poster { aspect-ratio: 16 / 9; }
     }
+
+    /* Delete Confirmation Modal */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(5, 7, 15, 0.78);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 10000;
+      padding: 16px;
+      animation: modalFadeIn 0.15s ease-out;
+    }
+    .modal-card {
+      background: #111422;
+      border: 1px solid rgba(239, 68, 68, 0.35);
+      border-radius: 14px;
+      max-width: 460px;
+      width: 100%;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6), 0 0 20px rgba(239, 68, 68, 0.15);
+      overflow: hidden;
+      animation: modalScaleUp 0.18s ease-out;
+    }
+    @keyframes modalFadeIn {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+    @keyframes modalScaleUp {
+      from { transform: scale(0.95); opacity: 0; }
+      to { transform: scale(1); opacity: 1; }
+    }
+    .modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 16px 20px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .modal-title {
+      font-size: 1.1rem;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .modal-close {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      font-size: 1.5rem;
+      cursor: pointer;
+      line-height: 1;
+      padding: 0 4px;
+    }
+    .modal-close:hover {
+      color: #fff;
+    }
+    .modal-body {
+      padding: 20px;
+    }
+    .modal-actions {
+      display: flex;
+      gap: 12px;
+      padding: 14px 20px;
+      background: rgba(10, 12, 20, 0.6);
+      border-top: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    /* Floating Toast Notification */
+    .toast-container {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      z-index: 10001;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      max-width: 380px;
+      width: calc(100% - 48px);
+      pointer-events: none;
+    }
+    .toast {
+      background: #1e1b4b;
+      border: 1px solid rgba(99, 102, 241, 0.4);
+      color: #fff;
+      padding: 12px 18px;
+      border-radius: 10px;
+      font-size: 0.9rem;
+      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.5);
+      pointer-events: auto;
+      animation: toastSlideIn 0.25s ease-out;
+      transition: opacity 0.3s ease, transform 0.3s ease;
+    }
+    .toast.toast-success {
+      background: #064e3b;
+      border-color: rgba(52, 211, 153, 0.5);
+      color: #a7f3d0;
+    }
+    .toast.toast-error {
+      background: #7f1d1d;
+      border-color: rgba(248, 113, 113, 0.5);
+      color: #fecaca;
+    }
+    .toast.toast-info {
+      background: #1e1b4b;
+      border-color: rgba(129, 140, 248, 0.5);
+      color: #e0e7ff;
+    }
+    .toast.fade-out {
+      opacity: 0;
+      transform: translateY(10px);
+    }
+    @keyframes toastSlideIn {
+      from { transform: translateY(20px); opacity: 0; }
+      to { transform: translateY(0); opacity: 1; }
+    }
+    @media (max-width: 640px) {
+      .toast-container {
+        right: 16px;
+        left: 16px;
+        bottom: 16px;
+        width: auto;
+        max-width: none;
+      }
+    }
   </style>
 </head>
 <body>
@@ -1714,6 +1887,43 @@ function handleDashboard(request, env) {
       Powered by Cloudflare Workers, GitHub Actions & Internet Archive. Zero-Cost, Permanent Streaming Infrastructure.
     </footer>
   </div>
+
+  <!-- DELETE CONFIRMATION MODAL -->
+  <div id="deleteModal" class="modal-overlay" style="display: none;">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div class="modal-title">
+          <span style="color: var(--error);">🗑️</span>
+          <span>Delete Video</span>
+        </div>
+        <button type="button" class="modal-close" onclick="closeDeleteModal()">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 14px;">
+          Are you sure you want to permanently delete this video from your Archive.org Cloud Vault and Nuvio catalog?
+        </p>
+        <div style="background: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.25); border-radius: 8px; padding: 12px; margin-bottom: 16px;">
+          <div id="modalVideoTitle" style="font-weight: 700; font-size: 0.95rem; color: #fff; word-break: break-word;"></div>
+          <div id="modalVideoFilename" style="font-size: 0.78rem; color: #f87171; margin-top: 4px; font-family: monospace; word-break: break-all;"></div>
+        </div>
+        <div class="form-group" style="margin-bottom: 8px;">
+          <label for="modalAdminPin" style="font-size: 0.85rem; font-weight: 600; color: #cbd5e1; margin-bottom: 6px; display: block;">Admin PIN *</label>
+          <input type="password" id="modalAdminPin" placeholder="Enter ADMIN_PIN" style="width: 100%;">
+        </div>
+        <label class="remember-label" style="margin-top: 6px; display: flex; align-items: center; gap: 6px;">
+          <input type="checkbox" id="modalRememberPin" checked> Remember PIN in browser
+        </label>
+        <div id="modalError" style="display: none; color: #f87171; font-size: 0.82rem; margin-top: 10px; background: rgba(239, 68, 68, 0.1); padding: 8px 10px; border-radius: 6px;"></div>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-secondary" onclick="closeDeleteModal()" style="flex: 1;">Cancel</button>
+        <button type="button" id="confirmDeleteBtn" class="btn btn-danger" onclick="confirmDeleteVideo()" style="flex: 1;">🗑️ Delete Video</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- FLOATING TOAST CONTAINER -->
+  <div id="toastContainer" class="toast-container"></div>
 
   <script>
     let pollTimer = null;
@@ -2192,13 +2402,13 @@ function handleDashboard(request, env) {
         }
 
         grid.innerHTML = items.map(item => {
-          const poster = item.poster || ('https://archive.org/services/img/' + (data.itemId || '${itemId}'));
+          const poster = (item.poster && !item.poster.includes('archive.org/services/img')) ? item.poster : '${defaultPoster}';
           const sizeStr = item.size_mb ? (item.size_mb + ' MB') : '';
           const streamUrl = item.direct_stream_url || ('https://archive.org/download/' + data.itemId + '/' + encodeURIComponent(item.filename));
 
           return \`
-            <div class="video-card">
-              <img src="\${poster}" alt="\${item.title}" class="video-poster" loading="lazy" onerror="this.src='https://archive.org/services/img/${itemId}'">
+            <div class="video-card" id="card-\${encodeURIComponent(item.id)}">
+              <img src="\${poster}" alt="\${item.title}" class="video-poster" loading="lazy" onerror="this.onerror=null;this.src='\${defaultPoster}';">
               <div class="video-info">
                 <div class="video-title" title="\${item.title}">\${item.title}</div>
                 <div class="video-meta">
@@ -2219,28 +2429,98 @@ function handleDashboard(request, env) {
       }
     }
 
+    function showToast(message, type, duration = 4000) {
+      const container = document.getElementById('toastContainer');
+      if (!container) return;
+      const toast = document.createElement('div');
+      toast.className = 'toast toast-' + (type || 'info');
+      toast.innerHTML = message;
+      container.appendChild(toast);
+      setTimeout(() => {
+        toast.classList.add('fade-out');
+        setTimeout(() => toast.remove(), 320);
+      }, duration);
+    }
+
+    let pendingDelete = null;
+
     function onDeleteBtnClick(btn) {
       const id = decodeURIComponent(btn.getAttribute('data-id') || '');
       const filename = decodeURIComponent(btn.getAttribute('data-filename') || '');
       const title = decodeURIComponent(btn.getAttribute('data-title') || '');
-      deleteVideo(id, filename, title);
+      openDeleteModal(id, filename, title);
     }
 
-    async function deleteVideo(id, filename, title) {
-      if (!confirm('Are you sure you want to permanently delete "' + title + '" from your Cloud Vault?')) {
+    function openDeleteModal(id, filename, title) {
+      pendingDelete = { id, filename, title };
+      const titleEl = document.getElementById('modalVideoTitle');
+      const fileEl = document.getElementById('modalVideoFilename');
+      const errBox = document.getElementById('modalError');
+      if (titleEl) titleEl.innerText = title;
+      if (fileEl) fileEl.innerText = filename;
+      if (errBox) errBox.style.display = 'none';
+
+      const savedPin = (document.getElementById('adminPin') ? document.getElementById('adminPin').value : '') || localStorage.getItem('nuvio_admin_pin') || '';
+      const pinInput = document.getElementById('modalAdminPin');
+      if (pinInput) {
+        pinInput.value = savedPin;
+      }
+
+      const modal = document.getElementById('deleteModal');
+      if (modal) modal.style.display = 'flex';
+      if (!savedPin && pinInput) {
+        setTimeout(() => pinInput.focus(), 80);
+      }
+    }
+
+    function closeDeleteModal() {
+      const modal = document.getElementById('deleteModal');
+      if (modal) modal.style.display = 'none';
+      pendingDelete = null;
+      const btn = document.getElementById('confirmDeleteBtn');
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = '🗑️ Delete Video';
+      }
+    }
+
+    async function confirmDeleteVideo() {
+      if (!pendingDelete) return;
+      const pinInput = document.getElementById('modalAdminPin');
+      const pin = (pinInput ? pinInput.value : '').trim();
+      const errBox = document.getElementById('modalError');
+
+      if (!pin) {
+        if (errBox) {
+          errBox.style.display = 'block';
+          errBox.innerText = 'Please enter your Admin PIN to proceed.';
+        }
+        if (pinInput) pinInput.focus();
         return;
       }
 
-      let pin = document.getElementById('adminPin').value;
-      if (!pin) {
-        pin = prompt('Enter your ADMIN_PIN to confirm deletion:');
-        if (!pin) return;
+      if (document.getElementById('modalRememberPin') && document.getElementById('modalRememberPin').checked) {
+        localStorage.setItem('nuvio_admin_pin', pin);
+        if (document.getElementById('adminPin')) {
+          document.getElementById('adminPin').value = pin;
+        }
       }
 
-      const alertBox = document.getElementById('alertBox');
-      alertBox.className = 'alert';
-      alertBox.style.display = 'flex';
-      alertBox.innerHTML = '⏳ Deleting "' + title + '" from Archive.org vault...';
+      const btn = document.getElementById('confirmDeleteBtn');
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '⏳ Deleting...';
+      }
+
+      const { id, filename, title } = pendingDelete;
+      showToast('⏳ Deleting "' + title + '" from Archive.org vault...', 'info', 5000);
+      closeDeleteModal();
+
+      const cardElem = document.getElementById('card-' + encodeURIComponent(id));
+      if (cardElem) {
+        cardElem.style.opacity = '0.35';
+        cardElem.style.pointerEvents = 'none';
+      }
 
       try {
         const res = await fetch('/api/delete', {
@@ -2251,21 +2531,38 @@ function handleDashboard(request, env) {
 
         const data = await res.json();
         if (res.ok && data.success) {
-          alertBox.className = 'alert success';
-          alertBox.style.display = 'flex';
-          alertBox.innerHTML = '✅ ' + data.message;
-          await loadCatalog();
+          showToast('✅ "' + title + '" deleted successfully!', 'success', 5000);
+          if (cardElem) {
+            cardElem.remove();
+            const remaining = document.querySelectorAll('.video-card').length;
+            const countSpan = document.getElementById('itemCount');
+            if (countSpan) countSpan.innerText = remaining + ' item' + (remaining === 1 ? '' : 's');
+          } else {
+            await loadCatalog();
+          }
         } else {
-          alertBox.className = 'alert error';
-          alertBox.style.display = 'flex';
-          alertBox.innerHTML = '❌ Delete failed: ' + (data.error || 'Unknown error');
+          showToast('❌ Delete failed: ' + (data.error || 'Unknown error'), 'error', 6000);
+          if (cardElem) {
+            cardElem.style.opacity = '1';
+            cardElem.style.pointerEvents = 'auto';
+          }
         }
       } catch (err) {
-        alertBox.className = 'alert error';
-        alertBox.style.display = 'flex';
-        alertBox.innerHTML = '❌ Network error: ' + err.message;
+        showToast('❌ Network error: ' + err.message, 'error', 6000);
+        if (cardElem) {
+          cardElem.style.opacity = '1';
+          cardElem.style.pointerEvents = 'auto';
+        }
       }
     }
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') closeDeleteModal();
+    });
+
+    document.addEventListener('click', (e) => {
+      if (e.target && e.target.id === 'deleteModal') closeDeleteModal();
+    });
   </script>
 </body>
 </html>`;
