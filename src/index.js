@@ -239,7 +239,6 @@ async function fetchCatalog(env, forceRefresh = false) {
   }
 
   const itemId = env.IA_ITEM_ID || 'nuvio-cloud-vault-2026';
-  const defaultPoster = DEFAULT_POSTER;
   const catalogUrl = `https://archive.org/download/${itemId}/catalog_index.json?_t=${Date.now()}`;
   const metadataUrl = `https://archive.org/metadata/${itemId}`;
 
@@ -499,7 +498,6 @@ async function handleCatalog(path, url, env) {
 
   // Format into Nuvio MetaPreview format with explicit landscape shape
   const itemId = env.IA_ITEM_ID || 'nuvio-cloud-vault-2026';
-  const defaultPoster = DEFAULT_POSTER;
   const metas = paginated.map((item) => ({
     id: item.id,
     type: item.type || 'movie',
@@ -525,7 +523,6 @@ async function handleMeta(path, env) {
   const requestedId = decodeURIComponent(match[1]);
   const catalog = await fetchCatalog(env);
   const itemId = env.IA_ITEM_ID || 'nuvio-cloud-vault-2026';
-  const defaultPoster = DEFAULT_POSTER;
 
   let item = catalog.items.find(
     (i) => i.id === requestedId || (i.imdb_id && i.imdb_id === requestedId)
@@ -583,7 +580,6 @@ async function handleStream(path, env) {
   const requestedId = decodeURIComponent(match[1]);
   const catalog = await fetchCatalog(env);
   const itemId = env.IA_ITEM_ID || 'nuvio-cloud-vault-2026';
-  const defaultPoster = DEFAULT_POSTER;
 
   let item = catalog.items.find(
     (i) => i.id === requestedId || (i.imdb_id && i.imdb_id === requestedId)
@@ -855,7 +851,6 @@ async function handleDelete(request, env) {
   }
 
   const itemId = env.IA_ITEM_ID || 'nuvio-cloud-vault-2026';
-  const defaultPoster = DEFAULT_POSTER;
   const accessKey = env.IA_ACCESS_KEY;
   const secretKey = env.IA_SECRET_KEY;
 
@@ -1175,7 +1170,6 @@ function handleDashboard(request, env) {
   const manifestUrl = `${protocol}//${host}/manifest.json`;
   const stremioDeepLink = `stremio://${host}/manifest.json`;
   const itemId = env.IA_ITEM_ID || 'nuvio-cloud-vault-2026';
-  const defaultPoster = DEFAULT_POSTER;
 
   const html = `<!DOCTYPE html>
 <html lang="en">
@@ -1926,6 +1920,7 @@ function handleDashboard(request, env) {
   <div id="toastContainer" class="toast-container"></div>
 
   <script>
+    const DEFAULT_POSTER = "${DEFAULT_POSTER}";
     let pollTimer = null;
     let activeJobs = [];
 
@@ -2402,13 +2397,13 @@ function handleDashboard(request, env) {
         }
 
         grid.innerHTML = items.map(item => {
-          const poster = (item.poster && !item.poster.includes('archive.org/services/img')) ? item.poster : '${defaultPoster}';
+          const poster = (item.poster && !item.poster.includes('archive.org/services/img')) ? item.poster : DEFAULT_POSTER;
           const sizeStr = item.size_mb ? (item.size_mb + ' MB') : '';
           const streamUrl = item.direct_stream_url || ('https://archive.org/download/' + data.itemId + '/' + encodeURIComponent(item.filename));
 
           return \`
             <div class="video-card" id="card-\${encodeURIComponent(item.id)}">
-              <img src="\${poster}" alt="\${item.title}" class="video-poster" loading="lazy" onerror="this.onerror=null;this.src='\${defaultPoster}';">
+              <img src="\${poster}" alt="\${item.title}" class="video-poster" loading="lazy" onerror="this.onerror=null;this.src=DEFAULT_POSTER;">
               <div class="video-info">
                 <div class="video-title" title="\${item.title}">\${item.title}</div>
                 <div class="video-meta">
